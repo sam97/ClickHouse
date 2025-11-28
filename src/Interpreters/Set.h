@@ -1,13 +1,13 @@
 #pragma once
 
-#include <Core/Block.h>
 #include <QueryPipeline/SizeLimits.h>
 #include <DataTypes/IDataType.h>
 #include <Interpreters/SetVariants.h>
-#include <Parsers/IAST.h>
+#include <Interpreters/SetKeys.h>
 #include <Storages/MergeTree/BoolMask.h>
 
 #include <Common/SharedMutex.h>
+#include <Interpreters/castColumn.h>
 
 
 namespace DB
@@ -18,6 +18,10 @@ struct Range;
 class Context;
 class IFunctionBase;
 using FunctionBasePtr = std::shared_ptr<const IFunctionBase>;
+using Sizes = std::vector<size_t>;
+
+struct ColumnWithTypeAndName;
+using ColumnsWithTypeAndName = std::vector<ColumnWithTypeAndName>;
 
 class Chunk;
 
@@ -30,11 +34,10 @@ public:
     /// (that is useful only for checking that some value is in the set and may not store the original values),
     /// store all set elements in explicit form.
     /// This is needed for subsequent use for index.
-    Set(const SizeLimits & limits_, bool fill_set_elements_, bool transform_null_in_)
-        : log(&Poco::Logger::get("Set")),
-        limits(limits_), fill_set_elements(fill_set_elements_), transform_null_in(transform_null_in_)
-    {
-    }
+    Set(const SizeLimits & limits_, size_t max_elements_to_fill_, bool transform_null_in_)
+        :  limits(limits_), transform_null_in(transform_null_in_), max_elements_to_fill(max_elements_to_fill_)
+        , log(getLogger("Set")), cast_cache(std::make_unique<InternalCastFunctionCache>())
+    {}
 
     /** Set can be created either from AST or from a stream of data (subquery result).
       */
@@ -45,8 +48,12 @@ public:
     void setHeader(const ColumnsWithTypeAndName & header);
 
     /// Returns false, if some limit was exceeded and no need to insert more data.
-    bool insertFromBlock(const Columns & columns);
+    bool insertFromColumns(const Columns & columns);
     bool insertFromBlock(const ColumnsWithTypeAndName & columns);
+
+    void fillSetElements();
+    bool insertFromColumns(const Columns & columns, SetKeyColumns & holder);
+    void appendSetElements(SetKeyColumns & holder);
 
     /// Call after all blocks were inserted. To get the information that set is already created.
     void finishInsert() { is_created = true; }
@@ -56,10 +63,14 @@ public:
 
     void checkIsCreated() const;
 
+    void processDateTime64Column(const ColumnWithTypeAndName & column_to_cast, ColumnPtr & result, ColumnPtr & null_map_holder, ConstNullMapPtr & null_map) const;
+
     /** For columns of 'block', check belonging of corresponding rows to the set.
       * Return UInt8 column with the result.
       */
     ColumnPtr execute(const ColumnsWithTypeAndName & columns, bool negative) const;
+
+    bool hasNull() const;
 
     bool empty() const;
     size_t getTotalRowCount() const;
@@ -68,12 +79,23 @@ public:
     const DataTypes & getDataTypes() const { return data_types; }
     const DataTypes & getElementsTypes() const { return set_elements_types; }
 
-    bool hasExplicitSetElements() const { return fill_set_elements; }
+    bool hasExplicitSetElements() const { return fill_set_elements || (!set_elements.empty() && set_elements.front()->size() == data.getTotalRowCount()); }
+    bool hasSetElements() const { return !set_elements.empty(); }
     Columns getSetElements() const { checkIsCreated(); return { set_elements.begin(), set_elements.end() }; }
 
     void checkColumnsNumber(size_t num_key_columns) const;
     bool areTypesEqual(size_t set_type_idx, const DataTypePtr & other_type) const;
     void checkTypesEqual(size_t set_type_idx, const DataTypePtr & other_type) const;
+
+    static DataTypes getElementTypes(DataTypes types, bool transform_null_in);
+
+    /// Limitations on the maximum size of the set
+    const SizeLimits limits;
+
+    /// If true, insert NULL values to set.
+    const bool transform_null_in;
+
+    const size_t max_elements_to_fill;
 
 private:
     size_t keys_size = 0;
@@ -104,16 +126,10 @@ private:
     /// Types for set_elements.
     DataTypes set_elements_types;
 
-    Poco::Logger * log;
-
-    /// Limitations on the maximum size of the set
-    SizeLimits limits;
+    LoggerPtr log;
 
     /// Do we need to additionally store all elements of the set in explicit form for subsequent use for index.
-    bool fill_set_elements;
-
-    /// If true, insert NULL values to set.
-    bool transform_null_in;
+    bool fill_set_elements = false;
 
     /// Check if set contains all the data.
     std::atomic<bool> is_created = false;
@@ -133,6 +149,10 @@ private:
       * These functions can be called simultaneously from different threads only when using StorageSet,
       */
     mutable SharedMutex rwlock;
+
+    /// A cache for cast functions (if any) to avoid rebuilding cast functions
+    /// for every call to `execute`
+    mutable std::unique_ptr<InternalCastFunctionCache> cast_cache;
 
     template <typename Method>
     void insertFromBlockImpl(
@@ -179,25 +199,6 @@ using Sets = std::vector<SetPtr>;
 class IFunction;
 using FunctionPtr = std::shared_ptr<IFunction>;
 
-/** Class that represents single value with possible infinities.
-  * Single field is stored in column for more optimal inplace comparisons with other regular columns.
-  * Extracting fields from columns and further their comparison is suboptimal and requires extra copying.
-  */
-struct FieldValue
-{
-    FieldValue(MutableColumnPtr && column_) : column(std::move(column_)) {}
-    void update(const Field & x);
-
-    bool isNormal() const { return !value.isPositiveInfinity() && !value.isNegativeInfinity(); }
-    bool isPositiveInfinity() const { return value.isPositiveInfinity(); }
-    bool isNegativeInfinity() const { return value.isNegativeInfinity(); }
-
-    Field value; // Null, -Inf, +Inf
-
-    // If value is Null, uses the actual value in column
-    MutableColumnPtr column;
-};
-
 
 /// Class for checkInRange function.
 class MergeTreeSetIndex
@@ -221,7 +222,30 @@ public:
 
     BoolMask checkInRange(const std::vector<Range> & key_ranges, const DataTypes & data_types, bool single_point = false) const;
 
+    const Columns & getOrderedSet() const { return ordered_set; }
+
+    const std::vector<KeyTuplePositionMapping> & getIndexesMapping() const { return indexes_mapping; }
+
 private:
+    /** Class that represents single value with possible infinities.
+      * Single field is stored in column for more optimal inplace comparisons with other regular columns.
+      * Extracting fields from columns and further their comparison is suboptimal and requires extra copying.
+      */
+    struct FieldValue
+    {
+        explicit FieldValue(MutableColumnPtr && column_) : column(std::move(column_)) {}
+        void update(const Field & x);
+
+        bool isNormal() const { return !value.isPositiveInfinity() && !value.isNegativeInfinity(); }
+        bool isPositiveInfinity() const { return value.isPositiveInfinity(); }
+        bool isNegativeInfinity() const { return value.isNegativeInfinity(); }
+
+        Field value; // Null, -Inf, +Inf
+
+        // If value is Null, uses the actual value in column
+        MutableColumnPtr column;
+    };
+
     // If all arguments in tuple are key columns, we can optimize NOT IN when there is only one element.
     bool has_all_keys;
     Columns ordered_set;

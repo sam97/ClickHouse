@@ -1,9 +1,8 @@
 #include <memory>
 
-#include "CurrentThread.h"
+#include <Common/CurrentThread.h>
 #include <Common/logger_useful.h>
 #include <Common/ThreadStatus.h>
-#include <Common/TaskStatsInfoGetter.h>
 #include <Interpreters/ProcessList.h>
 #include <Interpreters/Context.h>
 #include <base/getThreadId.h>
@@ -98,12 +97,120 @@ ThreadGroupPtr CurrentThread::getGroup()
     return current_thread->getThreadGroup();
 }
 
+ContextPtr CurrentThread::getQueryContext()
+{
+    if (unlikely(!current_thread))
+        return {};
+
+    return current_thread->getQueryContext();
+}
+
 std::string_view CurrentThread::getQueryId()
 {
     if (unlikely(!current_thread))
         return {};
 
     return current_thread->getQueryId();
+}
+
+void CurrentThread::attachReadResource(ResourceLink link)
+{
+    if (unlikely(!current_thread))
+        return;
+    if (current_thread->read_resource_link)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread #{} has been already attached to read resource", std::to_string(getThreadId()));
+    current_thread->read_resource_link = link;
+}
+
+void CurrentThread::detachReadResource()
+{
+    if (unlikely(!current_thread))
+        return;
+    if (!current_thread->read_resource_link)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread #{} has not been attached to read resource", std::to_string(getThreadId()));
+    current_thread->read_resource_link.reset();
+}
+
+ResourceLink CurrentThread::getReadResourceLink()
+{
+    if (unlikely(!current_thread))
+        return {};
+    return current_thread->read_resource_link;
+}
+
+void CurrentThread::attachWriteResource(ResourceLink link)
+{
+    if (unlikely(!current_thread))
+        return;
+    if (current_thread->write_resource_link)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread #{} has been already attached to write resource", std::to_string(getThreadId()));
+    current_thread->write_resource_link = link;
+}
+
+void CurrentThread::detachWriteResource()
+{
+    if (unlikely(!current_thread))
+        return;
+    if (!current_thread->write_resource_link)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread #{} has not been attached to write resource", std::to_string(getThreadId()));
+    current_thread->write_resource_link.reset();
+}
+
+ResourceLink CurrentThread::getWriteResourceLink()
+{
+    if (unlikely(!current_thread))
+        return {};
+    return current_thread->write_resource_link;
+}
+
+void CurrentThread::attachReadThrottler(const ThrottlerPtr & throttler)
+{
+    if (unlikely(!current_thread))
+        return;
+    if (current_thread->read_throttler)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread #{} has been already attached to read throttler", std::to_string(getThreadId()));
+    current_thread->read_throttler = throttler;
+}
+
+void CurrentThread::detachReadThrottler()
+{
+    if (unlikely(!current_thread))
+        return;
+    if (!current_thread->read_throttler)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread #{} has not been attached to read throttler", std::to_string(getThreadId()));
+    current_thread->read_throttler.reset();
+}
+
+ThrottlerPtr CurrentThread::getReadThrottler()
+{
+    if (unlikely(!current_thread))
+        return {};
+    return current_thread->read_throttler;
+}
+
+void CurrentThread::attachWriteThrottler(const ThrottlerPtr & throttler)
+{
+    if (unlikely(!current_thread))
+        return;
+    if (current_thread->write_throttler)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread #{} has been already attached to write throttler", std::to_string(getThreadId()));
+    current_thread->write_throttler = throttler;
+}
+
+void CurrentThread::detachWriteThrottler()
+{
+    if (unlikely(!current_thread))
+        return;
+    if (!current_thread->write_throttler)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread #{} has not been attached to write throttler", std::to_string(getThreadId()));
+    current_thread->write_throttler.reset();
+}
+
+ThrottlerPtr CurrentThread::getWriteThrottler()
+{
+    if (unlikely(!current_thread))
+        return {};
+    return current_thread->write_throttler;
 }
 
 MemoryTracker * CurrentThread::getUserMemoryTracker()

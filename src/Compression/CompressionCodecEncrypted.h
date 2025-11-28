@@ -18,6 +18,9 @@ enum EncryptionMethod
     MAX_ENCRYPTION_METHOD
 };
 
+/// Get encryption method for string name. Throw exception for wrong name.
+EncryptionMethod toEncryptionMethod(const std::string & name);
+
 /** This codec encrypts and decrypts blocks with AES-128 in
     * GCM-SIV mode (RFC-8452), which is the only cipher currently
     * supported. Although it is implemented as a compression codec
@@ -104,20 +107,11 @@ public:
     uint8_t getMethodByte() const override;
     void updateHash(SipHash & hash) const override;
 
-    bool isCompression() const override
-    {
-        return false;
-    }
+    bool isCompression() const override { return false; }
+    bool isGenericCompression() const override { return false; }
+    bool isEncryption() const override { return true; }
+    String getDescription() const override { return "Encrypts and decrypts blocks with AES-128 in GCM-SIV mode (RFC-8452)."; }
 
-    bool isGenericCompression() const override
-    {
-        return false;
-    }
-
-    bool isEncryption() const override
-    {
-        return true;
-    }
 protected:
     UInt32 getMaxCompressedDataSize(UInt32 uncompressed_size) const override;
 

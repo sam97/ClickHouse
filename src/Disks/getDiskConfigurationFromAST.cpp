@@ -13,6 +13,8 @@
 #include <Poco/DOM/Document.h>
 #include <Poco/DOM/Element.h>
 #include <Poco/DOM/Text.h>
+#include <Common/StringUtils.h>
+#include <boost/algorithm/string/trim.hpp>
 
 
 namespace DB
@@ -31,7 +33,7 @@ namespace ErrorCodes
         message.empty() ? "" : ": " + message);
 }
 
-Poco::AutoPtr<Poco::XML::Document> getDiskConfigurationFromASTImpl(const std::string & root_name, const ASTs & disk_args, ContextPtr context)
+Poco::AutoPtr<Poco::XML::Document> getDiskConfigurationFromASTImpl(const ASTs & disk_args, ContextPtr context)
 {
     if (disk_args.empty())
         throwBadConfiguration("expected non-empty list of arguments");
@@ -39,8 +41,6 @@ Poco::AutoPtr<Poco::XML::Document> getDiskConfigurationFromASTImpl(const std::st
     Poco::AutoPtr<Poco::XML::Document> xml_document(new Poco::XML::Document());
     Poco::AutoPtr<Poco::XML::Element> root(xml_document->createElement("disk"));
     xml_document->appendChild(root);
-    Poco::AutoPtr<Poco::XML::Element> disk_configuration(xml_document->createElement(root_name));
-    root->appendChild(disk_configuration);
 
     for (const auto & arg : disk_args)
     {
@@ -60,29 +60,48 @@ Poco::AutoPtr<Poco::XML::Document> getDiskConfigurationFromASTImpl(const std::st
         if (!key_identifier)
             throwBadConfiguration("expected the key (key=value) to be identifier");
 
-        const std::string & key = key_identifier->name();
+        std::string key = key_identifier->name();
         Poco::AutoPtr<Poco::XML::Element> key_element(xml_document->createElement(key));
-        disk_configuration->appendChild(key_element);
+        root->appendChild(key_element);
 
         if (!function_args[1]->as<ASTLiteral>() && !function_args[1]->as<ASTIdentifier>())
             throwBadConfiguration("expected values to be literals or identifiers");
 
         auto value = evaluateConstantExpressionOrIdentifierAsLiteral(function_args[1], context);
-        Poco::AutoPtr<Poco::XML::Text> value_element(xml_document->createTextNode(convertFieldToString(value->as<ASTLiteral>()->value)));
-        key_element->appendChild(value_element);
+        auto value_str = convertFieldToString(value->as<ASTLiteral>()->value);
+        if (key == "include")
+        {
+            key_element->setAttribute("incl", value_str);
+        }
+        else if (startsWith(value_str, "from_env"))
+        {
+            value_str = value_str.substr(std::strlen("from_env"));
+            boost::trim(value_str);
+            key_element->setAttribute("from_env", value_str);
+        }
+        else if (startsWith(value_str, "from_zk"))
+        {
+            value_str = value_str.substr(std::strlen("from_zk"));
+            boost::trim(value_str);
+            key_element->setAttribute("from_zk", value_str);
+        }
+        else
+        {
+            Poco::AutoPtr<Poco::XML::Text> value_element(xml_document->createTextNode(value_str));
+            key_element->appendChild(value_element);
+        }
     }
 
     return xml_document;
 }
 
-DiskConfigurationPtr getDiskConfigurationFromAST(const std::string & root_name, const ASTs & disk_args, ContextPtr context)
+DiskConfigurationPtr getDiskConfigurationFromAST(const ASTs & disk_args, ContextPtr context)
 {
-    auto xml_document = getDiskConfigurationFromASTImpl(root_name, disk_args, context);
+    auto xml_document = getDiskConfigurationFromASTImpl(disk_args, context);
     Poco::AutoPtr<Poco::Util::XMLConfiguration> conf(new Poco::Util::XMLConfiguration());
     conf->load(xml_document);
     return conf;
 }
-
 
 ASTs convertDiskConfigurationToAST(const Poco::Util::AbstractConfiguration & configuration, const std::string & config_path)
 {
@@ -94,7 +113,7 @@ ASTs convertDiskConfigurationToAST(const Poco::Util::AbstractConfiguration & con
     for (const auto & key : keys)
     {
         result.push_back(
-            makeASTFunction(
+            makeASTOperator(
                 "equals",
                 std::make_shared<ASTIdentifier>(key),
                 std::make_shared<ASTLiteral>(configuration.getString(config_path + "." + key))));

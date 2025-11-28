@@ -10,8 +10,10 @@ cluster = ClickHouseCluster(__file__)
 node = cluster.add_instance(
     "node",
     main_configs=["configs/enable_keeper_map.xml"],
+    user_configs=["configs/keeper_retries.xml"],
     with_zookeeper=True,
     stay_alive=True,
+    with_remote_database_disk=False,  # `test_keeper_map_without_zk` stops the Keeper connection, which might not work with the remote DB disk
 )
 
 
@@ -38,43 +40,107 @@ def remove_children(client, path):
         client.delete(child_path)
 
 
-def test_keeper_map_without_zk(started_cluster):
-    def assert_keeper_exception_after_partition(query):
-        with PartitionManager() as pm:
-            pm.drop_instance_zk_connections(node)
-            error = node.query_and_get_error(query)
+def assert_keeper_exception_after_partition(query):
+    with PartitionManager() as pm:
+        pm.drop_instance_zk_connections(node)
+        try:
+            error = node.query_and_get_error_with_retry(
+                query,
+                sleep_time=1,
+            )
             assert "Coordination::Exception" in error
+        except:
+            raise
 
+
+def run_query(query):
+    try:
+        result = node.query_with_retry(query, sleep_time=1)
+        return result
+    except:
+        raise
+
+
+def test_keeper_map_without_zk(started_cluster):
+    run_query("DROP TABLE IF EXISTS test_keeper_map_without_zk SYNC")
     assert_keeper_exception_after_partition(
-        "CREATE TABLE test_keeper_map_without_zk (key UInt64, value UInt64) ENGINE = KeeperMap('/test_without_zk') PRIMARY KEY(key);"
+        "CREATE TABLE test_keeper_map_without_zk (key UInt64, value UInt64) ENGINE = KeeperMap('/test_keeper_map_without_zk') PRIMARY KEY(key);"
     )
 
-    node.query(
-        "CREATE TABLE test_keeper_map_without_zk (key UInt64, value UInt64) ENGINE = KeeperMap('/test_without_zk') PRIMARY KEY(key);"
+    run_query(
+        "CREATE TABLE test_keeper_map_without_zk (key UInt64, value UInt64) ENGINE = KeeperMap('/test_keeper_map_without_zk') PRIMARY KEY(key);"
     )
 
     assert_keeper_exception_after_partition(
         "INSERT INTO test_keeper_map_without_zk VALUES (1, 11)"
     )
-    node.query("INSERT INTO test_keeper_map_without_zk VALUES (1, 11)")
+    run_query("INSERT INTO test_keeper_map_without_zk VALUES (1, 11)")
 
     assert_keeper_exception_after_partition("SELECT * FROM test_keeper_map_without_zk")
-    node.query("SELECT * FROM test_keeper_map_without_zk")
+    assert run_query("SELECT * FROM test_keeper_map_without_zk") == "1\t11\n"
 
     with PartitionManager() as pm:
         pm.drop_instance_zk_connections(node)
         node.restart_clickhouse(60)
-        error = node.query_and_get_error("SELECT * FROM test_keeper_map_without_zk")
-        assert "Failed to activate table because of connection issues" in error
+        try:
+            error = node.query_and_get_error_with_retry(
+                "SELECT * FROM test_keeper_map_without_zk",
+                sleep_time=1,
+            )
+            assert "Failed to activate table because of connection issues" in error
+        except:
+            raise
 
-    node.query("SELECT * FROM test_keeper_map_without_zk")
+    run_query("SELECT * FROM test_keeper_map_without_zk")
 
     client = get_genuine_zk()
-    remove_children(client, "/test_keeper_map/test_without_zk")
+    remove_children(client, "/test_keeper_map/test_keeper_map_without_zk")
     node.restart_clickhouse(60)
-    error = node.query_and_get_error("SELECT * FROM test_keeper_map_without_zk")
+    error = node.query_and_get_error_with_retry(
+        "SELECT * FROM test_keeper_map_without_zk"
+    )
     assert "Failed to activate table because of invalid metadata in ZooKeeper" in error
 
-    node.query("DETACH TABLE test_keeper_map_without_zk")
-
     client.stop()
+
+
+def test_keeper_map_with_failed_drop(started_cluster):
+    run_query("DROP TABLE IF EXISTS test_keeper_map_with_failed_drop SYNC")
+    run_query("DROP TABLE IF EXISTS test_keeper_map_with_failed_drop_another SYNC")
+    run_query(
+        "CREATE TABLE test_keeper_map_with_failed_drop (key UInt64, value UInt64) ENGINE = KeeperMap('/test_keeper_map_with_failed_drop') PRIMARY KEY(key);"
+    )
+
+    run_query("INSERT INTO test_keeper_map_with_failed_drop VALUES (1, 11)")
+    run_query("SYSTEM ENABLE FAILPOINT keepermap_fail_drop_data")
+    node.query("DROP TABLE test_keeper_map_with_failed_drop SYNC")
+
+    zk_client = get_genuine_zk()
+    assert (
+        zk_client.get("/test_keeper_map/test_keeper_map_with_failed_drop/data")
+        is not None
+    )
+
+    run_query("SYSTEM DISABLE FAILPOINT keepermap_fail_drop_data")
+    run_query(
+        "CREATE TABLE test_keeper_map_with_failed_drop_another (key UInt64, value UInt64) ENGINE = KeeperMap('/test_keeper_map_with_failed_drop') PRIMARY KEY(key);"
+    )
+
+def test_keeper_drop_after_update(started_cluster):
+    run_query("DROP TABLE IF EXISTS test_keeper_drop_after_update SYNC")
+    run_query(
+        "CREATE TABLE test_keeper_drop_after_update (key UInt64, value UInt64) ENGINE = KeeperMap('/test_keeper_drop_after_update') PRIMARY KEY(key);"
+    )
+
+    zk_client = get_genuine_zk()
+    assert (
+        zk_client.delete("/test_keeper_map/test_keeper_drop_after_update/metadata/drop_lock_version")
+        is not None
+    )
+
+    run_query("DROP TABLE test_keeper_drop_after_update SYNC")
+
+    assert (
+        zk_client.exists("/test_keeper_map/test_keeper_drop_after_update/data")
+        is None
+    )

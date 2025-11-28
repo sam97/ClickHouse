@@ -1,6 +1,5 @@
 #pragma once
 
-#include "Common/ZooKeeper/ZooKeeperCommon.h"
 #include "config.h"
 
 #if USE_NURAFT
@@ -8,10 +7,8 @@
 #include <Common/ThreadPool.h>
 #include <Common/ConcurrentBoundedQueue.h>
 #include <Poco/Util/AbstractConfiguration.h>
-#include <Common/Exception.h>
 #include <functional>
 #include <Coordination/KeeperServer.h>
-#include <Coordination/CoordinationSettings.h>
 #include <Coordination/Keeper4LWInfo.h>
 #include <Coordination/KeeperConnectionStats.h>
 #include <Coordination/KeeperSnapshotManagerS3.h>
@@ -20,18 +17,16 @@
 
 namespace DB
 {
-using ZooKeeperResponseCallback = std::function<void(const Coordination::ZooKeeperResponsePtr & response)>;
+using ZooKeeperResponseCallback = std::function<void(const Coordination::ZooKeeperResponsePtr & response, Coordination::ZooKeeperRequestPtr request)>;
 
 /// Highlevel wrapper for ClickHouse Keeper.
 /// Process user requests via consensus and return responses.
 class KeeperDispatcher
 {
 private:
-    mutable std::mutex push_request_mutex;
-
-    using RequestsQueue = ConcurrentBoundedQueue<KeeperStorage::RequestForSession>;
+    using RequestsQueue = ConcurrentBoundedQueue<KeeperRequestForSession>;
     using SessionToResponseCallback = std::unordered_map<int64_t, ZooKeeperResponseCallback>;
-    using UpdateConfigurationQueue = ConcurrentBoundedQueue<ConfigUpdateAction>;
+    using ClusterUpdateQueue = ConcurrentBoundedQueue<ClusterUpdateAction>;
 
     /// Size depends on coordination settings
     std::unique_ptr<RequestsQueue> requests_queue;
@@ -39,9 +34,7 @@ private:
     SnapshotsQueue snapshots_queue{1};
 
     /// More than 1k updates is definitely misconfiguration.
-    UpdateConfigurationQueue update_configuration_queue{1000};
-
-    std::atomic<bool> shutdown_called{false};
+    ClusterUpdateQueue cluster_update_queue{1000};
 
     mutable std::mutex session_to_response_callback_mutex;
     /// These two maps looks similar, but serves different purposes.
@@ -74,12 +67,14 @@ private:
 
     KeeperConfigurationAndSettingsPtr configuration_and_settings;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 
     /// Counter for new session_id requests.
     std::atomic<int64_t> internal_session_id_counter{0};
 
     KeeperSnapshotManagerS3 snapshot_s3;
+
+    KeeperContextPtr keeper_context;
 
     /// Thread put requests to raft
     void requestThread();
@@ -89,24 +84,27 @@ private:
     void sessionCleanerTask();
     /// Thread create snapshots in the background
     void snapshotThread();
-    /// Thread apply or wait configuration changes from leader
-    void updateConfigurationThread();
 
-    void setResponse(int64_t session_id, const Coordination::ZooKeeperResponsePtr & response);
+    // TODO (myrrc) this should be removed once "reconfig" is stabilized
+    void clusterUpdateWithReconfigDisabledThread();
+    void clusterUpdateThread();
+
+    void setResponse(int64_t session_id, const Coordination::ZooKeeperResponsePtr & response, Coordination::ZooKeeperRequestPtr request = nullptr);
 
     /// Add error responses for requests to responses queue.
     /// Clears requests.
-    void addErrorResponses(const KeeperStorage::RequestsForSessions & requests_for_sessions, Coordination::Error error);
+    void addErrorResponses(const KeeperRequestsForSessions & requests_for_sessions, Coordination::Error error);
 
     /// Forcefully wait for result and sets errors if something when wrong.
     /// Clears both arguments
-    void forceWaitAndProcessResult(RaftAppendResult & result, KeeperStorage::RequestsForSessions & requests_for_sessions);
+    nuraft::ptr<nuraft::buffer> forceWaitAndProcessResult(
+        RaftAppendResult & result, KeeperRequestsForSessions & requests_for_sessions, bool clear_requests_on_success);
 
 public:
     std::mutex read_request_queue_mutex;
 
     /// queue of read requests that can be processed after a request with specific session ID and XID is committed
-    std::unordered_map<int64_t, std::unordered_map<Coordination::XID, KeeperStorage::RequestsForSessions>> read_request_queue;
+    std::unordered_map<int64_t, std::unordered_map<Coordination::XID, KeeperRequestsForSessions>> read_request_queue;
 
     /// Just allocate some objects, real initialization is done by `intialize method`
     KeeperDispatcher();
@@ -130,10 +128,9 @@ public:
     /// and achieved quorum
     bool isServerActive() const;
 
-    /// Registered in ConfigReloader callback. Add new configuration changes to
-    /// update_configuration_queue. Keeper Dispatcher apply them asynchronously.
-    /// 'macros' are used to substitute macros in endpoint of disks
     void updateConfiguration(const Poco::Util::AbstractConfiguration & config, const MultiVersion<Macros>::Version & macros);
+    void pushClusterUpdates(ClusterUpdateActions && actions);
+    bool reconfigEnabled() const;
 
     /// Shutdown internal keeper parts (server, state machine, log storage, etc)
     void shutdown();
@@ -141,7 +138,7 @@ public:
     void forceRecovery();
 
     /// Put request to ClickHouse Keeper
-    bool putRequest(const Coordination::ZooKeeperRequestPtr & request, int64_t session_id);
+    bool putRequest(const Coordination::ZooKeeperRequestPtr & request, int64_t session_id, bool use_xid_64);
 
     /// Get new session ID
     int64_t getSessionID(int64_t session_timeout_ms);
@@ -176,6 +173,11 @@ public:
         return server->isObserver();
     }
 
+    bool isExceedingMemorySoftLimit() const
+    {
+        return server->isExceedingMemorySoftLimit();
+    }
+
     uint64_t getLogDirSize() const;
 
     uint64_t getSnapDirSize() const;
@@ -188,7 +190,7 @@ public:
 
     Keeper4LWInfo getKeeper4LWInfo() const;
 
-    const KeeperStateMachine & getStateMachine() const
+    const IKeeperStateMachine & getStateMachine() const
     {
         return *server->getKeeperStateMachine();
     }
@@ -196,6 +198,11 @@ public:
     const KeeperConfigurationAndSettingsPtr & getKeeperConfigurationAndSettings() const
     {
         return configuration_and_settings;
+    }
+
+    const KeeperContextPtr & getKeeperContext() const
+    {
+        return keeper_context;
     }
 
     void incrementPacketsSent()
@@ -231,12 +238,20 @@ public:
         return server->requestLeader();
     }
 
+    /// Yield leadership and become follower.
+    void yieldLeadership()
+    {
+        server->yieldLeadership();
+    }
+
     void recalculateStorageStats()
     {
-        return server->recalculateStorageStats();
+        server->recalculateStorageStats();
     }
 
     static void cleanResources();
+
+    std::optional<AuthenticationData> getAuthenticationData() const { return server->getAuthenticationData(); }
 };
 
 }

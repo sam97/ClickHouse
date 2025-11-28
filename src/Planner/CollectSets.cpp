@@ -1,19 +1,27 @@
 #include <Planner/CollectSets.h>
 
-#include <Interpreters/Context.h>
-#include <Interpreters/PreparedSets.h>
-
 #include <Storages/StorageSet.h>
 
-#include <Analyzer/Utils.h>
-#include <Analyzer/SetUtils.h>
-#include <Analyzer/InDepthQueryTreeVisitor.h>
 #include <Analyzer/ConstantNode.h>
 #include <Analyzer/FunctionNode.h>
+#include <Analyzer/InDepthQueryTreeVisitor.h>
+#include <Analyzer/SetUtils.h>
 #include <Analyzer/TableNode.h>
+#include <Analyzer/Utils.h>
+#include <Core/Settings.h>
+#include <DataTypes/DataTypeTuple.h>
+#include <Interpreters/Set.h>
+#include <Planner/Planner.h>
+#include <Planner/PlannerContext.h>
+
 
 namespace DB
 {
+namespace Setting
+{
+    extern const SettingsBool transform_null_in;
+    extern const SettingsBool validate_enum_literals_in_operators;
+}
 
 namespace ErrorCodes
 {
@@ -32,6 +40,12 @@ public:
 
     void visitImpl(const QueryTreeNodePtr & node)
     {
+        if (const auto * constant_node = node->as<ConstantNode>())
+            /// Collect sets from source expression as well.
+            /// Most likely we will not build them, but those sets could be requested during analysis.
+            if (constant_node->hasSourceExpression())
+                collectSets(constant_node->getSourceExpression(), planner_context);
+
         auto * function_node = node->as<FunctionNode>();
         if (!function_node || !isNameOfInFunction(function_node->getFunctionName()))
             return;
@@ -41,11 +55,7 @@ public:
         auto in_second_argument_node_type = in_second_argument->getNodeType();
 
         const auto & settings = planner_context.getQueryContext()->getSettingsRef();
-
-        String set_key = planner_context.createSetKey(in_second_argument);
-
-        if (planner_context.hasSet(set_key))
-            return;
+        auto & sets = planner_context.getPreparedSets();
 
         /// Tables and table functions are replaced with subquery at Analysis stage, except special Set table.
         auto * second_argument_table = in_second_argument->as<TableNode>();
@@ -54,22 +64,51 @@ public:
         if (storage_set)
         {
             /// Handle storage_set as ready set.
-            planner_context.registerSet(set_key, PlannerSet(FutureSet(storage_set->getSet())));
+            auto set_key = in_second_argument->getTreeHash({.ignore_cte = true});
+            if (sets.findStorage(set_key))
+                return;
+            auto ast = in_second_argument->toAST();
+            sets.addFromStorage(set_key, std::move(ast), storage_set->getSet(), second_argument_table->getStorageID());
         }
         else if (const auto * constant_node = in_second_argument->as<ConstantNode>())
         {
-            auto set = makeSetForConstantValue(
-                in_first_argument->getResultType(),
-                constant_node->getValue(),
-                constant_node->getResultType(),
-                settings);
+            auto set = getSetElementsForConstantValue(
+                in_first_argument->getResultType(), constant_node->getValue(), constant_node->getResultType(),
+                GetSetElementParams{
+                    .transform_null_in = settings[Setting::transform_null_in],
+                    .forbid_unknown_enum_values = settings[Setting::validate_enum_literals_in_operators],
+                });
 
-            planner_context.registerSet(set_key, PlannerSet(FutureSet(std::move(set))));
+            DataTypes set_element_types = {in_first_argument->getResultType()};
+            const auto * left_tuple_type = typeid_cast<const DataTypeTuple *>(set_element_types.front().get());
+
+            /// Do not unpack if empty tuple or single element tuple
+            if (left_tuple_type && left_tuple_type->getElements().size() > 1)
+                set_element_types = left_tuple_type->getElements();
+
+            set_element_types = Set::getElementTypes(std::move(set_element_types), settings[Setting::transform_null_in]);
+            auto set_key = in_second_argument->getTreeHash({.ignore_cte = true});
+
+            if (sets.findTuple(set_key, set_element_types))
+                return;
+
+            auto ast = in_second_argument->toAST();
+            sets.addFromTuple(set_key, std::move(ast), std::move(set), settings);
         }
         else if (in_second_argument_node_type == QueryTreeNodeType::QUERY ||
-            in_second_argument_node_type == QueryTreeNodeType::UNION)
+            in_second_argument_node_type == QueryTreeNodeType::UNION ||
+            in_second_argument_node_type == QueryTreeNodeType::TABLE)
         {
-            planner_context.registerSet(set_key, PlannerSet(in_second_argument));
+            auto set_key = in_second_argument->getTreeHash({.ignore_cte = true});
+            if (sets.findSubquery(set_key))
+                return;
+
+            auto subquery_to_execute = in_second_argument;
+            if (in_second_argument->as<TableNode>())
+                subquery_to_execute = buildSubqueryToReadColumnsFromTableExpression(subquery_to_execute, planner_context.getQueryContext());
+
+            auto ast = in_second_argument->toAST({ .set_subquery_cte_name = false });
+            sets.addFromSubquery(set_key, std::move(ast), std::move(subquery_to_execute), settings);
         }
         else
         {

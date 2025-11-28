@@ -4,7 +4,6 @@
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ExpressionElementParsers.h>
-#include <Parsers/formatAST.h>
 #include <Parsers/parseQuery.h>
 
 
@@ -18,14 +17,14 @@ namespace ErrorCodes
 String BackupInfo::toString() const
 {
     ASTPtr ast = toAST();
-    return serializeAST(*ast);
+    return ast->formatWithSecretsOneLine();
 }
 
 
 BackupInfo BackupInfo::fromString(const String & str)
 {
     ParserIdentifierWithOptionalParameters parser;
-    ASTPtr ast = parseQuery(parser, str, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH);
+    ASTPtr ast = parseQuery(parser, str, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
     return fromAST(*ast);
 }
 
@@ -48,6 +47,9 @@ ASTPtr BackupInfo::toAST() const
     for (const auto & arg : args)
         list->children.push_back(std::make_shared<ASTLiteral>(arg));
 
+    if (function_arg)
+        list->children.push_back(function_arg);
+
     return func;
 }
 
@@ -56,7 +58,7 @@ BackupInfo BackupInfo::fromAST(const IAST & ast)
 {
     const auto * func = ast.as<const ASTFunction>();
     if (!func)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected function, got {}", serializeAST(ast));
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected function, got {}", ast.formatForErrorMessage());
 
     BackupInfo res;
     res.backup_engine_name = func->name;
@@ -65,7 +67,7 @@ BackupInfo BackupInfo::fromAST(const IAST & ast)
     {
         const auto * list = func->arguments->as<const ASTExpressionList>();
         if (!list)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected list, got {}", serializeAST(*func->arguments));
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected list, got {}", func->arguments->formatForErrorMessage());
 
         size_t index = 0;
         if (!list->children.empty())
@@ -78,13 +80,21 @@ BackupInfo BackupInfo::fromAST(const IAST & ast)
             }
         }
 
-        res.args.reserve(list->children.size() - index);
-        for (; index < list->children.size(); ++index)
+        size_t args_size = list->children.size();
+        res.args.reserve(args_size - index);
+        for (; index < args_size; ++index)
         {
             const auto & elem = list->children[index];
             const auto * lit = elem->as<const ASTLiteral>();
             if (!lit)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected literal, got {}", serializeAST(*elem));
+            {
+                if (index == args_size - 1 && elem->as<const ASTFunction>())
+                {
+                    res.function_arg = elem;
+                    break;
+                }
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected literal, got {}", elem->formatForErrorMessage());
+            }
             res.args.push_back(lit->value);
         }
     }
@@ -96,6 +106,25 @@ BackupInfo BackupInfo::fromAST(const IAST & ast)
 String BackupInfo::toStringForLogging() const
 {
     return toAST()->formatForLogging();
+}
+
+void BackupInfo::copyS3CredentialsTo(BackupInfo & dest) const
+{
+    /// named_collection case, no need to update
+    if (!dest.id_arg.empty() || !id_arg.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "use_same_s3_credentials_for_base_backup is not compatible with named_collections");
+
+    if (backup_engine_name != "S3")
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "use_same_s3_credentials_for_base_backup supported only for S3, got {}", toStringForLogging());
+    if (dest.backup_engine_name != "S3")
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "use_same_s3_credentials_for_base_backup supported only for S3, got {}", dest.toStringForLogging());
+    if (args.size() != 3)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "use_same_s3_credentials_for_base_backup requires access_key_id, secret_access_key, got {}", toStringForLogging());
+
+    auto & dest_args = dest.args;
+    dest_args.resize(3);
+    dest_args[1] = args[1];
+    dest_args[2] = args[2];
 }
 
 }

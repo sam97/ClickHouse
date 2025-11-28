@@ -33,6 +33,12 @@ class TableJoin;
 class QueryPipelineBuilder;
 using QueryPipelineBuilderPtr = std::unique_ptr<QueryPipelineBuilder>;
 
+struct SetAndKey;
+using SetAndKeyPtr = std::shared_ptr<SetAndKey>;
+
+class PreparedSetsCache;
+using PreparedSetsCachePtr = std::shared_ptr<PreparedSetsCache>;
+
 class QueryPipelineBuilder
 {
 public:
@@ -56,8 +62,8 @@ public:
     using StreamType = Pipe::StreamType;
 
     /// Add transform with simple input and simple output for each port.
-    void addSimpleTransform(const Pipe::ProcessorGetter & getter);
-    void addSimpleTransform(const Pipe::ProcessorGetterWithStreamKind & getter);
+    void addSimpleTransform(const Pipe::ProcessorGetterSharedHeader & getter);
+    void addSimpleTransform(const Pipe::ProcessorGetterSharedHeaderWithStreamKind & getter);
     /// Add transform with getNumStreams() input ports.
     void addTransform(ProcessorPtr transform);
     void addTransform(ProcessorPtr transform, InputPort * totals, InputPort * extremes);
@@ -77,7 +83,7 @@ public:
     void addExtremesTransform();
     /// Sink is a processor with single input port and no output ports. Creates sink for each output port.
     /// Pipeline will be completed after this transformation.
-    void setSinks(const Pipe::ProcessorGetterWithStreamKind & getter);
+    void setSinks(const Pipe::ProcessorGetterSharedHeaderWithStreamKind & getter);
 
     /// Add totals which returns one chunk with single row with defaults.
     void addDefaultTotals();
@@ -88,10 +94,11 @@ public:
     /// Will read from this stream after all data was read from other streams.
     void addDelayedStream(ProcessorPtr source);
 
-    void addMergingAggregatedMemoryEfficientTransform(AggregatingTransformParamsPtr params, size_t num_merging_processors);
+    void addMergingAggregatedMemoryEfficientTransform(
+        AggregatingTransformParamsPtr params, size_t num_merging_processors, bool should_produce_results_in_order_of_bucket_number);
 
     /// Changes the number of output ports if needed. Adds ResizeTransform.
-    void resize(size_t num_streams, bool force = false, bool strict = false);
+    void resize(size_t num_streams, bool strict = false, UInt64 min_outstreams_per_resize_after_split = 0);
 
     /// Concat some ports to have no more then size outputs.
     /// This method is needed for Merge table engine in case of reading from many tables.
@@ -118,10 +125,20 @@ public:
         std::unique_ptr<QueryPipelineBuilder> left,
         std::unique_ptr<QueryPipelineBuilder> right,
         JoinPtr join,
-        const Block & output_header,
+        SharedHeader & output_header,
         size_t max_block_size,
+        size_t min_block_size_rows,
+        size_t min_block_size_bytes,
         size_t max_streams,
         bool keep_left_read_in_order,
+        Processors * collected_processors = nullptr);
+
+    static std::unique_ptr<QueryPipelineBuilder> joinPipelinesByShards(
+        std::unique_ptr<QueryPipelineBuilder> left,
+        std::unique_ptr<QueryPipelineBuilder> right,
+        JoinPtr join,
+        SharedHeader & output_header,
+        size_t max_block_size,
         Processors * collected_processors = nullptr);
 
     /// Join two independent pipelines, processing them simultaneously.
@@ -129,7 +146,15 @@ public:
         std::unique_ptr<QueryPipelineBuilder> left,
         std::unique_ptr<QueryPipelineBuilder> right,
         JoinPtr table_join,
-        const Block & out_header,
+        SharedHeader & out_header,
+        size_t max_block_size,
+        Processors * collected_processors = nullptr);
+
+    static std::unique_ptr<QueryPipelineBuilder> joinPipelinesYShapedByShards(
+        std::unique_ptr<QueryPipelineBuilder> left,
+        std::unique_ptr<QueryPipelineBuilder> right,
+        JoinPtr table_join,
+        SharedHeader & out_header,
         size_t max_block_size,
         Processors * collected_processors = nullptr);
 
@@ -138,7 +163,12 @@ public:
     /// This is used for CreatingSets.
     void addPipelineBefore(QueryPipelineBuilder pipeline);
 
-    void addCreatingSetsTransform(const Block & res_header, SubqueryForSet subquery_for_set, const SizeLimits & limits, ContextPtr context);
+    void addCreatingSetsTransform(
+        SharedHeader res_header,
+        SetAndKeyPtr set_and_key,
+        StoragePtr external_table,
+        const SizeLimits & limits,
+        PreparedSetsCachePtr prepared_sets_cache);
 
     PipelineExecutorPtr execute();
 
@@ -147,6 +177,7 @@ public:
     bool hasTotals() const { return pipe.getTotalsPort() != nullptr; }
 
     const Block & getHeader() const { return pipe.getHeader(); }
+    const SharedHeader & getSharedHeader() const { return pipe.getSharedHeader(); }
 
     void setProcessListElement(QueryStatusPtr elem);
     void setProgressCallback(ProgressCallback callback);
@@ -172,8 +203,19 @@ public:
             max_threads = max_threads_;
     }
 
-    void addResources(QueryPlanResourceHolder resources_) { resources = std::move(resources_); }
+    void setConcurrencyControl(bool concurrency_control_)
+    {
+        concurrency_control = concurrency_control_;
+    }
+
+    bool getConcurrencyControl() const
+    {
+        return concurrency_control;
+    }
+
+    void addResources(const QueryPlanResourceHolder & resources_) { resources.append(resources_); }
     void setQueryIdHolder(std::shared_ptr<QueryIdHolder> query_id_holder) { resources.query_id_holders.emplace_back(std::move(query_id_holder)); }
+    void addContext(ContextPtr context) { resources.interpreter_context.emplace_back(std::move(context)); }
 
     /// Convert query pipeline to pipe.
     static Pipe getPipe(QueryPipelineBuilder pipeline, QueryPlanResourceHolder & resources);
@@ -188,6 +230,8 @@ private:
     /// Limit on the number of threads. Zero means no limit.
     /// Sometimes, more streams are created then the number of threads for more optimal execution.
     size_t max_threads = 0;
+
+    bool concurrency_control = false;
 
     QueryStatusPtr process_list_element;
     ProgressCallback progress_callback = nullptr;

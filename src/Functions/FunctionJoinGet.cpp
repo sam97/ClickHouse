@@ -1,20 +1,124 @@
-#include <Functions/FunctionJoinGet.h>
-
 #include <Columns/ColumnString.h>
+#include <Core/Block.h>
+#include <Core/Settings.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
+#include <Functions/IFunction.h>
 #include <Interpreters/Context.h>
-#include <Interpreters/HashJoin.h>
+#include <Interpreters/DatabaseCatalog.h>
+#include <Interpreters/HashJoin/HashJoin.h>
 #include <Storages/StorageJoin.h>
+#include <Storages/TableLockHolder.h>
 
 
 namespace DB
 {
+namespace Setting
+{
+    extern const SettingsSeconds lock_acquire_timeout;
+}
+
 namespace ErrorCodes
 {
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
 }
+
+class HashJoin;
+using StorageJoinPtr = std::shared_ptr<StorageJoin>;
+
+namespace
+{
+
+template <bool or_null>
+class ExecutableFunctionJoinGet final : public IExecutableFunction, WithContext
+{
+public:
+    ExecutableFunctionJoinGet(ContextPtr context_,
+                              TableLockHolder table_lock_,
+                              StorageJoinPtr storage_join_,
+                              const DB::Block & result_columns_)
+        : WithContext(context_)
+        , table_lock(std::move(table_lock_))
+        , storage_join(std::move(storage_join_))
+        , result_columns(result_columns_)
+    {}
+
+    static constexpr auto name = or_null ? "joinGetOrNull" : "joinGet";
+
+    bool useDefaultImplementationForNulls() const override { return false; }
+    bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
+    bool useDefaultImplementationForConstants() const override { return true; }
+
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override;
+
+    String getName() const override { return name; }
+
+private:
+    TableLockHolder table_lock;
+    StorageJoinPtr storage_join;
+    DB::Block result_columns;
+};
+
+template <bool or_null>
+class FunctionJoinGet final : public IFunctionBase, WithContext
+{
+public:
+    static constexpr auto name = or_null ? "joinGetOrNull" : "joinGet";
+
+    FunctionJoinGet(ContextPtr context_,
+                    TableLockHolder table_lock_,
+                    StorageJoinPtr storage_join_, String attr_name_,
+                    DataTypes argument_types_, DataTypePtr return_type_)
+        : WithContext(context_)
+        , table_lock(std::move(table_lock_))
+        , storage_join(storage_join_)
+        , attr_name(std::move(attr_name_))
+        , argument_types(std::move(argument_types_))
+        , return_type(std::move(return_type_))
+    {
+    }
+
+    String getName() const override { return name; }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
+    const DataTypes & getArgumentTypes() const override { return argument_types; }
+    const DataTypePtr & getResultType() const override { return return_type; }
+
+    ExecutableFunctionPtr prepare(const ColumnsWithTypeAndName &) const override;
+
+private:
+    TableLockHolder table_lock;
+    StorageJoinPtr storage_join;
+    const String attr_name;
+    DataTypes argument_types;
+    DataTypePtr return_type;
+};
+
+template <bool or_null>
+class JoinGetOverloadResolver final : public IFunctionOverloadResolver, WithContext
+{
+public:
+    static constexpr auto name = or_null ? "joinGetOrNull" : "joinGet";
+    static FunctionOverloadResolverPtr create(ContextPtr context_) { return std::make_unique<JoinGetOverloadResolver>(context_); }
+
+    explicit JoinGetOverloadResolver(ContextPtr context_) : WithContext(context_) {}
+
+    bool isDeterministic() const override { return false; }
+    String getName() const override { return name; }
+
+    FunctionBasePtr buildImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &) const override;
+    DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName &) const override { return {}; } // Not used
+
+    bool useDefaultImplementationForNulls() const override { return false; }
+    bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
+
+    bool isVariadic() const override { return true; }
+    size_t getNumberOfArguments() const override { return 0; }
+    ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {0, 1}; }
+};
+
 
 template <bool or_null>
 ColumnPtr ExecutableFunctionJoinGet<or_null>::executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t) const
@@ -35,7 +139,7 @@ ExecutableFunctionPtr FunctionJoinGet<or_null>::prepare(const ColumnsWithTypeAnd
     return std::make_unique<ExecutableFunctionJoinGet<or_null>>(getContext(), table_lock, storage_join, result_columns);
 }
 
-static std::pair<std::shared_ptr<StorageJoin>, String>
+std::pair<std::shared_ptr<StorageJoin>, String>
 getJoin(const ColumnsWithTypeAndName & arguments, ContextPtr context)
 {
     String join_name;
@@ -88,7 +192,7 @@ FunctionBasePtr JoinGetOverloadResolver<or_null>::buildImpl(const ColumnsWithTyp
     }
 
     auto return_type = storage_join->joinGetCheckAndGetReturnType(data_types, attr_name, or_null || storage_join->useNulls());
-    auto table_lock = storage_join->lockForShare(getContext()->getInitialQueryId(), getContext()->getSettingsRef().lock_acquire_timeout);
+    auto table_lock = storage_join->lockForShare(getContext()->getInitialQueryId(), getContext()->getSettingsRef()[Setting::lock_acquire_timeout]);
 
     if (storage_join->useNulls())
         return std::make_unique<FunctionJoinGet<true>>(getContext(), table_lock, storage_join, attr_name, argument_types, return_type);
@@ -96,18 +200,111 @@ FunctionBasePtr JoinGetOverloadResolver<or_null>::buildImpl(const ColumnsWithTyp
     return std::make_unique<FunctionJoinGet<or_null>>(getContext(), table_lock, storage_join, attr_name, argument_types, return_type);
 }
 
-REGISTER_FUNCTION(JoinGet)
-{
-    // joinGet
-    factory.registerFunction<JoinGetOverloadResolver<false>>();
-    // joinGetOrNull
-    factory.registerFunction<JoinGetOverloadResolver<true>>();
 }
 
-template class ExecutableFunctionJoinGet<true>;
-template class ExecutableFunctionJoinGet<false>;
-template class FunctionJoinGet<true>;
-template class FunctionJoinGet<false>;
-template class JoinGetOverloadResolver<true>;
-template class JoinGetOverloadResolver<false>;
+REGISTER_FUNCTION(JoinGet)
+{
+    FunctionDocumentation::Description description_joinGet = R"(
+Allows you to extract data from a table the same way as from a dictionary.
+Gets data from Join tables using the specified join key.
+
+:::note
+Only supports tables created with the `ENGINE = Join(ANY, LEFT, <join_keys>)` [statement](/engines/table-engines/special/join).
+:::
+)";
+    FunctionDocumentation::Syntax syntax_joinGet = "joinGet(join_storage_table_name, value_column, join_keys)";
+    FunctionDocumentation::Arguments arguments_joinGet = {
+        {"join_storage_table_name", "An identifier which indicates where to perform the search. The identifier is searched in the default database (see parameter `default_database` in the config file). To override the default database, use the `USE database_name` query or specify the database and the table through a dot, like `database_name.table_name`.", {"String"}},
+        {"value_column", "The name of the column of the table that contains required data.", {"const String"}},
+        {"join_keys", "A list of join keys.", {"Any"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value_joinGet = {"Returns list of values corresponded to list of keys.", {"Any"}};
+    FunctionDocumentation::Examples examples_joinGet = {
+    {
+        "Usage example",
+        R"(
+CREATE TABLE db_test.id_val(`id` UInt32, `val` UInt32) ENGINE = Join(ANY, LEFT, id);
+INSERT INTO db_test.id_val VALUES (1,11)(2,12)(4,13);
+
+SELECT joinGet(db_test.id_val, 'val', toUInt32(1));
+        )",
+        R"(
+┌─joinGet(db_test.id_val, 'val', toUInt32(1))─┐
+│                                          11 │
+└─────────────────────────────────────────────┘
+        )"
+    },
+    {
+        "Usage with table from current database",
+        R"(
+USE db_test;
+SELECT joinGet(id_val, 'val', toUInt32(2));
+        )",
+        R"(
+┌─joinGet(id_val, 'val', toUInt32(2))─┐
+│                                  12 │
+└─────────────────────────────────────┘
+        )"
+    },
+    {
+        "Using arrays as join keys",
+        R"(
+CREATE TABLE some_table (id1 UInt32, id2 UInt32, name String) ENGINE = Join(ANY, LEFT, id1, id2);
+INSERT INTO some_table VALUES (1, 11, 'a') (2, 12, 'b') (3, 13, 'c');
+
+SELECT joinGet(some_table, 'name', 1, 11);
+        )",
+        R"(
+┌─joinGet(some_table, 'name', 1, 11)─┐
+│ a                                  │
+└────────────────────────────────────┘
+        )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in_joinGet = {18, 16};
+    FunctionDocumentation::Category category_joinGet = FunctionDocumentation::Category::Other;
+    FunctionDocumentation documentation_joinGet = {description_joinGet, syntax_joinGet, arguments_joinGet, returned_value_joinGet, examples_joinGet, introduced_in_joinGet, category_joinGet};
+
+    FunctionDocumentation::Description description_joinGetOrNull = R"(
+Allows you to extract data from a table the same way as from a dictionary.
+Gets data from Join tables using the specified join key.
+Unlike [`joinGet`](#joinGet) it returns `NULL` when the key is missing.
+
+:::note
+Only supports tables created with the `ENGINE = Join(ANY, LEFT, <join_keys>)` [statement](/engines/table-engines/special/join).
+:::
+)";
+    FunctionDocumentation::Syntax syntax_joinGetOrNull = "joinGetOrNull(join_storage_table_name, value_column, join_keys)";
+    FunctionDocumentation::Arguments arguments_joinGetOrNull = {
+        {"join_storage_table_name", "An identifier which indicates where to perform the search. The identifier is searched in the default database (see parameter default_database in the config file). To override the default database, use the `USE database_name` query or specify the database and the table through a dot, like `database_name.table_name`.", {"String"}},
+        {"value_column", "The name of the column of the table that contains required data.", {"const String"}},
+        {"join_keys", "A list of join keys.", {"Any"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value_joinGetOrNull = {"Returns a list of values corresponding to the list of keys, or `NULL` if a key is not found.", {"Any"}};
+    FunctionDocumentation::Examples examples_joinGetOrNull = {
+    {
+        "Usage example",
+        R"(
+CREATE TABLE db_test.id_val(`id` UInt32, `val` UInt32) ENGINE = Join(ANY, LEFT, id);
+INSERT INTO db_test.id_val VALUES (1,11)(2,12)(4,13);
+
+SELECT joinGetOrNull(db_test.id_val, 'val', toUInt32(1)), joinGetOrNull(db_test.id_val, 'val', toUInt32(999));
+        )",
+        R"(
+┌─joinGetOrNull(db_test.id_val, 'val', toUInt32(1))─┬─joinGetOrNull(db_test.id_val, 'val', toUInt32(999))─┐
+│                                                11 │                                                ᴺᵁᴸᴸ │
+└───────────────────────────────────────────────────┴─────────────────────────────────────────────────────┘
+        )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in_joinGetOrNull = {20, 4};
+    FunctionDocumentation::Category category_joinGetOrNull = FunctionDocumentation::Category::Other;
+    FunctionDocumentation documentation_joinGetOrNull = {description_joinGetOrNull, syntax_joinGetOrNull, arguments_joinGetOrNull, returned_value_joinGetOrNull, examples_joinGetOrNull, introduced_in_joinGetOrNull, category_joinGetOrNull};
+
+    // joinGet
+    factory.registerFunction<JoinGetOverloadResolver<false>>(documentation_joinGet);
+    // joinGetOrNull
+    factory.registerFunction<JoinGetOverloadResolver<true>>(documentation_joinGetOrNull);
+}
+
 }

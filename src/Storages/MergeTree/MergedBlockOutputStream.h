@@ -1,8 +1,8 @@
 #pragma once
 
 #include <Storages/MergeTree/IMergedBlockOutputStream.h>
-#include <Columns/ColumnArray.h>
 #include <IO/WriteSettings.h>
+#include <Storages/Statistics/Statistics.h>
 
 
 namespace DB
@@ -19,8 +19,11 @@ public:
         const StorageMetadataPtr & metadata_snapshot_,
         const NamesAndTypesList & columns_list_,
         const MergeTreeIndices & skip_indices,
+        const ColumnsStatistics & statistics,
         CompressionCodecPtr default_codec_,
-        const MergeTreeTransactionPtr & txn,
+        MergeTreeIndexGranularityPtr index_granularity_ptr,
+        TransactionID tid,
+        size_t part_uncompressed_bytes,
         bool reset_columns_ = false,
         bool blocks_are_granules_size = false,
         const WriteSettings & write_settings = {});
@@ -29,6 +32,8 @@ public:
 
     /// If the data is pre-sorted.
     void write(const Block & block) override;
+
+    void cancel() noexcept override;
 
     /** If the data is not sorted, but we have previously calculated the permutation, that will sort it.
       * This method is used to save RAM, since you do not need to keep two blocks at once - the original one and the sorted one.
@@ -48,8 +53,8 @@ public:
         Finalizer & operator=(Finalizer &&) noexcept;
         ~Finalizer();
 
-
         void finish();
+        void cancel() noexcept;
     };
 
     /// Finalize writing part and fill inner structures
@@ -58,13 +63,15 @@ public:
         const MergeTreeMutableDataPartPtr & new_part,
         bool sync,
         const NamesAndTypesList * total_columns_list = nullptr,
-        MergeTreeData::DataPart::Checksums * additional_column_checksums = nullptr);
+        MergeTreeData::DataPart::Checksums * additional_column_checksums = nullptr,
+        ColumnsSubstreams * additional_columns_substreams = nullptr);
 
     void finalizePart(
         const MergeTreeMutableDataPartPtr & new_part,
         bool sync,
         const NamesAndTypesList * total_columns_list = nullptr,
-        MergeTreeData::DataPart::Checksums * additional_column_checksums = nullptr);
+        MergeTreeData::DataPart::Checksums * additional_column_checksums = nullptr,
+        ColumnsSubstreams * additional_columns_substreams = nullptr);
 
 private:
     /** If `permutation` is given, it rearranges the values in the columns when writing.
@@ -75,7 +82,8 @@ private:
     using WrittenFiles = std::vector<std::unique_ptr<WriteBufferFromFileBase>>;
     WrittenFiles finalizePartOnDisk(
         const MergeTreeMutableDataPartPtr & new_part,
-        MergeTreeData::DataPart::Checksums & checksums);
+        MergeTreeData::DataPart::Checksums & checksums,
+        ColumnsSubstreams * additional_columns_substreams = nullptr);
 
     NamesAndTypesList columns_list;
     IMergeTreeDataPart::MinMaxIndex minmax_idx;

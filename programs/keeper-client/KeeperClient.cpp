@@ -1,12 +1,24 @@
-#include "KeeperClient.h"
-#include "Commands.h"
+#include <KeeperClient.h>
+#include <Commands.h>
 #include <Client/ReplxxLineReader.h>
 #include <Client/ClientBase.h>
+#include <Common/VersionNumber.h>
+#include <Common/Config/ConfigProcessor.h>
+#include <Client/ClientApplicationBase.h>
 #include <Common/EventNotifier.h>
+#include <Common/ZooKeeper/IKeeper.h>
+#include <Common/ZooKeeper/ZooKeeperArgs.h>
 #include <Common/filesystemHelpers.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <Parsers/parseQuery.h>
 #include <Poco/Util/HelpFormatter.h>
+
+#if USE_SSL
+#include <Poco/Net/Context.h>
+#include <Poco/Net/SSLManager.h>
+#include <Poco/Net/AcceptCertificateHandler.h>
+#include <Poco/Net/RejectCertificateHandler.h>
+#endif
 
 
 namespace DB
@@ -32,6 +44,7 @@ String KeeperClient::executeFourLetterCommand(const String & command)
 
     out.write(command.data(), command.size());
     out.next();
+    out.finalize();
 
     String result;
     readStringUntilEOF(result, in);
@@ -42,7 +55,7 @@ String KeeperClient::executeFourLetterCommand(const String & command)
 std::vector<String> KeeperClient::getCompletions(const String & prefix) const
 {
     Tokens tokens(prefix.data(), prefix.data() + prefix.size(), 0, false);
-    IParser::Pos pos(tokens, 0);
+    IParser::Pos pos(tokens, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
 
     if (pos->type != TokenType::BareWord)
         return registered_commands_and_four_letter_words;
@@ -74,7 +87,7 @@ std::vector<String> KeeperClient::getCompletions(const String & prefix) const
         for (const auto & child : zookeeper->getChildren(parent_path))
             result.push_back(child);
     }
-    catch (Coordination::Exception &) {}
+    catch (Coordination::Exception &) {} // NOLINT(bugprone-empty-catch)
 
     std::sort(result.begin(), result.end());
 
@@ -83,8 +96,14 @@ std::vector<String> KeeperClient::getCompletions(const String & prefix) const
 
 void KeeperClient::askConfirmation(const String & prompt, std::function<void()> && callback)
 {
+    if (!ask_confirmation)
+    {
+        callback();
+        return;
+    }
+
     std::cout << prompt << " Continue?\n";
-    need_confirmation = true;
+    waiting_confirmation = true;
     confirmation_callback = callback;
 }
 
@@ -127,43 +146,93 @@ void KeeperClient::defineOptions(Poco::Util::OptionSet & options)
 
     options.addOption(
         Poco::Util::Option("host", "h", "server hostname. default `localhost`")
-            .argument("host")
+            .argument("<host>")
             .binding("host"));
 
     options.addOption(
-        Poco::Util::Option("port", "p", "server port. default `2181`")
-            .argument("port")
+        Poco::Util::Option("port", "p", "server port. default `9181`")
+            .argument("<port>")
             .binding("port"));
 
     options.addOption(
+        Poco::Util::Option("password", "", "password to connect to keeper server")
+            .argument("<password>")
+            .binding("password"));
+
+    options.addOption(
         Poco::Util::Option("query", "q", "will execute given query, then exit.")
-            .argument("query")
+            .argument("<query>")
             .binding("query"));
 
     options.addOption(
         Poco::Util::Option("connection-timeout", "", "set connection timeout in seconds. default 10s.")
-            .argument("connection-timeout")
+            .argument("<seconds>")
             .binding("connection-timeout"));
 
     options.addOption(
         Poco::Util::Option("session-timeout", "", "set session timeout in seconds. default 10s.")
-            .argument("session-timeout")
+            .argument("<seconds>")
             .binding("session-timeout"));
 
     options.addOption(
         Poco::Util::Option("operation-timeout", "", "set operation timeout in seconds. default 10s.")
-            .argument("operation-timeout")
+            .argument("<seconds>")
             .binding("operation-timeout"));
 
     options.addOption(
+        Poco::Util::Option("use-xid-64", "", "use 64-bit XID. default false.")
+            .binding("use-xid-64"));
+
+    options.addOption(
+        Poco::Util::Option("config-file", "c", "if set, will try to get a connection string from clickhouse config. default `config.xml`")
+            .argument("<file>")
+            .binding("config-file"));
+
+    options.addOption(
         Poco::Util::Option("history-file", "", "set path of history file. default `~/.keeper-client-history`")
-            .argument("history-file")
+            .argument("<file>")
             .binding("history-file"));
 
     options.addOption(
         Poco::Util::Option("log-level", "", "set log level")
-            .argument("log-level")
+            .argument("<level>")
             .binding("log-level"));
+
+    options.addOption(
+        Poco::Util::Option("no-confirmation", "", "if set, will not require a confirmation on several commands. default false for interactive and true for query")
+            .binding("no-confirmation"));
+
+    options.addOption(
+        Poco::Util::Option("tests-mode", "", "run keeper-client in a special mode for tests. all commands output are separated by special symbols. default false")
+            .binding("tests-mode"));
+
+    options.addOption(
+        Poco::Util::Option("identity", "", "connect to Keeper using authentication with specified identity. default no identity")
+            .argument("<identity>")
+            .binding("identity"));
+
+    options.addOption(
+        Poco::Util::Option("secure", "s", "use secure connection (adds secure:// prefix to host). default false")
+            .binding("secure"));
+
+    options.addOption(
+        Poco::Util::Option("tls-cert-file", "", "path to TLS certificate file for secure connection")
+            .argument("<file>")
+            .binding("tls-cert-file"));
+
+    options.addOption(
+        Poco::Util::Option("tls-key-file", "", "path to TLS private key file for secure connection")
+            .argument("<file>")
+            .binding("tls-key-file"));
+
+    options.addOption(
+        Poco::Util::Option("tls-ca-file", "", "path to TLS CA certificate file for secure connection")
+            .argument("<file>")
+            .binding("tls-ca-file"));
+
+    options.addOption(
+        Poco::Util::Option("accept-invalid-certificate", "", "accept invalid TLS certificates (bypasses verification). default false")
+            .binding("accept-invalid-certificate"));
 }
 
 void KeeperClient::initialize(Poco::Util::Application & /* self */)
@@ -176,11 +245,26 @@ void KeeperClient::initialize(Poco::Util::Application & /* self */)
         std::make_shared<CDCommand>(),
         std::make_shared<SetCommand>(),
         std::make_shared<CreateCommand>(),
+        std::make_shared<TouchCommand>(),
         std::make_shared<GetCommand>(),
+        std::make_shared<ExistsCommand>(),
+        std::make_shared<GetStatCommand>(),
+        std::make_shared<FindSuperNodes>(),
+        std::make_shared<DeleteStaleBackups>(),
+        std::make_shared<FindBigFamily>(),
         std::make_shared<RMCommand>(),
         std::make_shared<RMRCommand>(),
+        std::make_shared<ReconfigCommand>(),
+        std::make_shared<SyncCommand>(),
         std::make_shared<HelpCommand>(),
         std::make_shared<FourLetterWordCommand>(),
+        std::make_shared<GetDirectChildrenNumberCommand>(),
+        std::make_shared<GetAllChildrenNumberCommand>(),
+        std::make_shared<CPCommand>(),
+        std::make_shared<CPRCommand>(),
+        std::make_shared<MVCommand>(),
+        std::make_shared<MVRCommand>(),
+        std::make_shared<GetAclCommand>(),
     });
 
     String home_path;
@@ -206,74 +290,126 @@ void KeeperClient::initialize(Poco::Util::Application & /* self */)
         }
     }
 
-    Poco::Logger::root().setLevel(config().getString("log-level", "error"));
+    history_max_entries = config().getUInt("history-max-entries", 1000000);
+
+    String default_log_level;
+    if (config().has("query"))
+        /// We don't want to see any information log in query mode, unless it was set explicitly
+        default_log_level = "error";
+    else
+        default_log_level = "information";
+
+    Poco::Logger::root().setLevel(config().getString("log-level", default_log_level));
 
     EventNotifier::init();
 }
 
-void KeeperClient::executeQuery(const String & query)
+bool KeeperClient::processQueryText(const String & text, bool is_interactive)
 {
-    std::vector<String> queries;
-    boost::algorithm::split(queries, query, boost::is_any_of(";"));
-
-    for (const auto & query_text : queries)
-    {
-        if (!query_text.empty())
-            processQueryText(query_text);
-    }
-}
-
-bool KeeperClient::processQueryText(const String & text)
-{
-    if (exit_strings.find(text) != exit_strings.end())
+    if (exit_strings.contains(text))
         return false;
 
-    try
+    static constexpr size_t total_retries = 10;
+    std::chrono::milliseconds current_sleep{100};
+    size_t i = 0;
+
+    while (true)
     {
-        if (need_confirmation)
+        try
         {
-            need_confirmation = false;
-            if (text.size() == 1 && (text == "y" || text == "Y"))
-                confirmation_callback();
-            return true;
+            if (i > 0)
+                connectToKeeper();
+
+            if (waiting_confirmation)
+            {
+                waiting_confirmation = false;
+                if (text.size() == 1 && (text == "y" || text == "Y"))
+                    confirmation_callback();
+                return true;
+            }
+
+            KeeperParser parser;
+            const char * begin = text.data();
+            const char * end = begin + text.size();
+
+            while (begin < end)
+            {
+                String message;
+                ASTPtr res = tryParseQuery(
+                    parser,
+                    begin,
+                    end,
+                    /* out_error_message = */ message,
+                    /* hilite = */ true,
+                    /* description = */ "",
+                    /* allow_multi_statements = */ true,
+                    /* max_query_size = */ 0,
+                    /* max_parser_depth = */ 0,
+                    /* max_parser_backtracks = */ 0,
+                    /* skip_insignificant = */ false);
+
+                if (!res)
+                {
+                    std::cerr << message << "\n";
+                    return true;
+                }
+
+                auto * query = res->as<ASTKeeperQuery>();
+
+                auto command = KeeperClient::commands.find(query->command);
+                command->second->execute(query, this);
+            }
+
+            break;
         }
-
-        KeeperParser parser;
-        String message;
-        const char * begin = text.data();
-        ASTPtr res = tryParseQuery(parser, begin, begin + text.size(), message, true, "", false, 0, 0, false);
-
-        if (!res)
+        catch (Coordination::Exception & err)
         {
-            std::cerr << message << "\n";
-            return true;
+            std::cerr << err.message() << "\n";
+
+            if (!is_interactive || !Coordination::isHardwareError(err.code))
+                break;
+
+            if (i == total_retries)
+            {
+                std::cerr << "Failed to connect to Keeper" << std::endl;
+                break;
+            }
+
+            ++i;
+            current_sleep = std::min<std::chrono::milliseconds>(current_sleep * 2, std::chrono::milliseconds{5000});
+            std::cerr << fmt::format("Will try to reconnect after {}ms ({}/{})", current_sleep.count(), i, total_retries) << std::endl;
+            std::this_thread::sleep_for(current_sleep);
         }
-
-        auto * query = res->as<ASTKeeperQuery>();
-
-        auto command = KeeperClient::commands.find(query->command);
-        command->second->execute(query, this);
-    }
-    catch (Coordination::Exception & err)
-    {
-        std::cerr << err.message() << "\n";
     }
     return true;
 }
 
-void KeeperClient::runInteractive()
+void KeeperClient::runInteractiveReplxx()
 {
 
     LineReader::Patterns query_extenders = {"\\"};
     LineReader::Patterns query_delimiters = {};
+    char word_break_characters[] = " \t\v\f\a\b\r\n/";
 
-    ReplxxLineReader lr(suggest, history_file, false, query_extenders, query_delimiters, {});
+    auto reader_options = ReplxxLineReader::Options
+    {
+        .suggest = suggest,
+        .history_file_path = history_file,
+        .history_max_entries = history_max_entries,
+        .multiline = false,
+        .ignore_shell_suspend = false,
+        .extenders = query_extenders,
+        .delimiters = query_delimiters,
+        .word_break_characters = word_break_characters,
+        .highlighter = {},
+    };
+    ReplxxLineReader lr(std::move(reader_options));
     lr.enableBracketedPaste();
 
     while (true)
     {
         String prompt;
-        if (need_confirmation)
+        if (waiting_confirmation)
             prompt = "[y/n] ";
         else
             prompt = cwd.string() + " :) ";
@@ -282,9 +418,123 @@ void KeeperClient::runInteractive()
         if (input.empty())
             break;
 
-        if (!processQueryText(input))
+        if (!processQueryText(input, /*is_interactive=*/true))
             break;
     }
+
+    std::cout << std::endl;
+}
+
+void KeeperClient::runInteractiveInputStream()
+{
+    for (String input; std::getline(std::cin, input);)
+    {
+        if (!processQueryText(input, /*is_interactive=*/true))
+            break;
+
+        std::cout << "\a\a\a\a" << std::endl;
+        std::cerr << std::flush;
+    }
+}
+
+void KeeperClient::runInteractive()
+{
+    if (config().hasOption("tests-mode"))
+        runInteractiveInputStream();
+    else
+        runInteractiveReplxx();
+}
+
+void KeeperClient::connectToKeeper()
+{
+#if USE_SSL
+    /// Configure SSL context if TLS options are provided
+    if (config().has("tls-cert-file") || config().has("tls-key-file") || config().has("tls-ca-file") || config().has("accept-invalid-certificate"))
+    {
+        Poco::Net::Context::VerificationMode verification_mode = Poco::Net::Context::VERIFY_RELAXED;
+
+        if (config().has("accept-invalid-certificate"))
+        {
+            verification_mode = Poco::Net::Context::VERIFY_NONE;
+        }
+
+        auto context = Poco::Net::Context::Ptr(new Poco::Net::Context(
+            Poco::Net::Context::TLSV1_2_CLIENT_USE,
+            config().getString("tls-key-file", ""),
+            config().getString("tls-cert-file", ""),
+            config().getString("tls-ca-file", ""),
+            verification_mode,
+            9,
+            true,
+            "ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH"
+        ));
+
+        Poco::Net::SSLManager::InvalidCertificateHandlerPtr certificate_handler;
+        if (config().has("accept-invalid-certificate"))
+        {
+            certificate_handler = new Poco::Net::AcceptCertificateHandler(false);
+        }
+        else
+        {
+            certificate_handler = new Poco::Net::RejectCertificateHandler(false);
+        }
+
+        Poco::Net::SSLManager::instance().initializeClient(nullptr, certificate_handler, context);
+    }
+#endif
+
+    ConfigProcessor config_processor(config().getString("config-file", "config.xml"));
+
+    /// This will handle a situation when clickhouse is running on the embedded config, but config.d folder is also present.
+    ConfigProcessor::registerEmbeddedConfig("config.xml", "<clickhouse/>");
+    auto clickhouse_config = config_processor.loadConfig();
+
+    Poco::Util::AbstractConfiguration::Keys keys;
+    clickhouse_config.configuration->keys("zookeeper", keys);
+
+    zkutil::ZooKeeperArgs new_zk_args;
+
+    if (!config().has("host") && !config().has("port") && !keys.empty())
+    {
+        LOG_INFO(getLogger("KeeperClient"), "Found keeper node in the config.xml, will use it for connection");
+
+        for (const auto & key : keys)
+        {
+            if (key != "node")
+                continue;
+
+            String prefix = "zookeeper." + key;
+            String host = clickhouse_config.configuration->getString(prefix + ".host");
+            String port = clickhouse_config.configuration->getString(prefix + ".port");
+
+            if (clickhouse_config.configuration->has(prefix + ".secure") || config().has("secure"))
+                host = "secure://" + host;
+
+            new_zk_args.hosts.push_back(host + ":" + port);
+        }
+    }
+    else
+    {
+        String host = config().getString("host", "localhost");
+        String port = config().getString("port", "9181");
+
+        if (config().has("secure"))
+            host = "secure://" + host;
+
+        new_zk_args.hosts.push_back(host + ":" + port);
+    }
+
+    new_zk_args.availability_zones.resize(new_zk_args.hosts.size());
+    new_zk_args.connection_timeout_ms = config().getInt("connection-timeout", 10) * 1000;
+    new_zk_args.session_timeout_ms = config().getInt("session-timeout", 10) * 1000;
+    new_zk_args.operation_timeout_ms = config().getInt("operation-timeout", 10) * 1000;
+    new_zk_args.use_xid_64 = config().hasOption("use-xid-64");
+    new_zk_args.password = config().getString("password", "");
+    new_zk_args.identity = config().getString("identity", "");
+    if (!new_zk_args.identity.empty())
+        new_zk_args.auth_scheme = "digest";
+    zk_args = new_zk_args;
+    zookeeper = zkutil::ZooKeeper::createWithoutKillingPreviousSessions(std::move(new_zk_args));
 }
 
 int KeeperClient::main(const std::vector<String> & /* args */)
@@ -298,18 +548,21 @@ int KeeperClient::main(const std::vector<String> & /* args */)
         return 0;
     }
 
-    auto host = config().getString("host", "localhost");
-    auto port = config().getString("port", "2181");
-    zk_args.hosts = {host + ":" + port};
-    zk_args.connection_timeout_ms = config().getInt("connection-timeout", 10) * 1000;
-    zk_args.session_timeout_ms = config().getInt("session-timeout", 10) * 1000;
-    zk_args.operation_timeout_ms = config().getInt("operation-timeout", 10) * 1000;
-    zookeeper = std::make_unique<zkutil::ZooKeeper>(zk_args);
+    connectToKeeper();
+
+    if (config().has("no-confirmation") || config().has("query"))
+        ask_confirmation = false;
 
     if (config().has("query"))
-        executeQuery(config().getString("query"));
+    {
+        processQueryText(config().getString("query"), /*is_interactive=*/false);
+    }
     else
         runInteractive();
+
+    /// Suppress "Finalizing session {}" message.
+    getLogger("ZooKeeperClient")->setLevel("error");
+    zookeeper.reset();
 
     return 0;
 }
@@ -325,10 +578,11 @@ int mainEntryClickHouseKeeperClient(int argc, char ** argv)
         client.init(argc, argv);
         return client.run();
     }
-    catch (const DB::Exception & e)
+    catch (DB::Exception & e)
     {
-        std::cerr << DB::getExceptionMessage(e, false) << std::endl;
-        return 1;
+        std::cerr << DB::getExceptionMessageForLogging(e, false) << std::endl;
+        auto code = DB::getCurrentExceptionCode();
+        return static_cast<UInt8>(code) ? code : 1;
     }
     catch (const boost::program_options::error & e)
     {
@@ -338,6 +592,7 @@ int mainEntryClickHouseKeeperClient(int argc, char ** argv)
     catch (...)
     {
         std::cerr << DB::getCurrentExceptionMessage(true) << std::endl;
-        return 1;
+        auto code = DB::getCurrentExceptionCode();
+        return static_cast<UInt8>(code) ? code : 1;
     }
 }

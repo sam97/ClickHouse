@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-parallel, no-fasttest, no-upgrade-check
+# Tags: zookeeper, no-parallel, no-fasttest
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -12,7 +12,10 @@ for i in $(seq $REPLICAS); do
 done
 
 for i in $(seq $REPLICAS); do
-    $CLICKHOUSE_CLIENT --query "CREATE TABLE concurrent_alter_detach_$i (key UInt64, value1 UInt8, value2 UInt8) ENGINE = ReplicatedMergeTree('/clickhouse/tables/$CLICKHOUSE_TEST_ZOOKEEPER_PREFIX/concurrent_alter_detach', '$i') ORDER BY key SETTINGS max_replicated_mutations_in_queue=1000, number_of_free_entries_in_pool_to_execute_mutation=0,max_replicated_merges_in_queue=1000,temporary_directories_lifetime=10,cleanup_delay_period=3,cleanup_delay_period_random_add=0"
+    $CLICKHOUSE_CLIENT --query "CREATE TABLE concurrent_alter_detach_$i (key UInt64, value1 UInt8, value2 UInt8)
+    ENGINE = ReplicatedMergeTree('/clickhouse/tables/$CLICKHOUSE_TEST_ZOOKEEPER_PREFIX/concurrent_alter_detach', '$i') ORDER BY key
+    SETTINGS max_replicated_mutations_in_queue=1000, number_of_free_entries_in_pool_to_execute_mutation=0,max_replicated_merges_in_queue=1000,
+    temporary_directories_lifetime=10,cleanup_delay_period=3,cleanup_delay_period_random_add=0,cleanup_thread_preferred_points_per_iteration=0"
 done
 
 $CLICKHOUSE_CLIENT --query "INSERT INTO concurrent_alter_detach_1 SELECT number, number + 10, number from numbers(10)"
@@ -31,7 +34,9 @@ INITIAL_SUM=$($CLICKHOUSE_CLIENT --query "SELECT SUM(value1) FROM concurrent_alt
 function correct_alter_thread()
 {
     TYPES=(Float64 String UInt8 UInt32)
-    while true; do
+    local TIMELIMIT=$((SECONDS+TIMEOUT))
+    while [ $SECONDS -lt "$TIMELIMIT" ]
+    do
         REPLICA=$(($RANDOM % 3 + 1))
         TYPE=${TYPES[$RANDOM % ${#TYPES[@]} ]}
         $CLICKHOUSE_CLIENT --query "ALTER TABLE concurrent_alter_detach_$REPLICA MODIFY COLUMN value1 $TYPE SETTINGS replication_alter_partitions_sync=0"; # additionaly we don't wait anything for more heavy concurrency
@@ -44,9 +49,10 @@ function correct_alter_thread()
 # insert queries will fail sometime because of wrong types.
 function insert_thread()
 {
-
     VALUES=(7.0 7 '7')
-    while true; do
+    local TIMELIMIT=$((SECONDS+TIMEOUT))
+    while [ $SECONDS -lt "$TIMELIMIT" ]
+    do
         REPLICA=$(($RANDOM % 3 + 1))
         VALUE=${VALUES[$RANDOM % ${#VALUES[@]} ]}
         $CLICKHOUSE_CLIENT --query "INSERT INTO concurrent_alter_detach_$REPLICA VALUES($RANDOM, $VALUE, $VALUE)"
@@ -56,7 +62,9 @@ function insert_thread()
 
 function detach_attach_thread()
 {
-    while true; do
+    local TIMELIMIT=$((SECONDS+TIMEOUT))
+    while [ $SECONDS -lt "$TIMELIMIT" ]
+    do
         REPLICA=$(($RANDOM % 3 + 1))
         $CLICKHOUSE_CLIENT --query "DETACH TABLE concurrent_alter_detach_$REPLICA"
         sleep 0.$RANDOM
@@ -65,22 +73,19 @@ function detach_attach_thread()
 }
 
 echo "Starting alters"
-export -f correct_alter_thread;
-export -f insert_thread;
-export -f detach_attach_thread;
 
 TIMEOUT=15
 
 # Sometimes we detach and attach tables
-timeout $TIMEOUT bash -c detach_attach_thread 2> /dev/null &
+detach_attach_thread 2> /dev/null &
 
-timeout $TIMEOUT bash -c correct_alter_thread 2> /dev/null &
+correct_alter_thread 2> /dev/null &
 
-timeout $TIMEOUT bash -c insert_thread 2> /dev/null &
-timeout $TIMEOUT bash -c insert_thread 2> /dev/null &
-timeout $TIMEOUT bash -c insert_thread 2> /dev/null &
-timeout $TIMEOUT bash -c insert_thread 2> /dev/null &
-timeout $TIMEOUT bash -c insert_thread 2> /dev/null &
+insert_thread 2> /dev/null &
+insert_thread 2> /dev/null &
+insert_thread 2> /dev/null &
+insert_thread 2> /dev/null &
+insert_thread 2> /dev/null &
 
 wait
 

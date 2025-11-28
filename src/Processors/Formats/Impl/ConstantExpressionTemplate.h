@@ -1,9 +1,8 @@
 #pragma once
 
 #include <Core/Block.h>
-#include <Formats/FormatSettings.h>
 #include <Parsers/TokenIterator.h>
-#include <Parsers/IAST.h>
+#include <Parsers/IAST_fwd.h>
 #include <Interpreters/Context_fwd.h>
 
 namespace DB
@@ -15,6 +14,9 @@ struct SpecialParserType;
 
 class ExpressionActions;
 using ExpressionActionsPtr = std::shared_ptr<ExpressionActions>;
+
+struct FormatSettings;
+struct Settings;
 
 /// Deduces template of an expression by replacing literals with dummy columns.
 /// It allows to parse and evaluate similar expressions without using heavy IParsers and ExpressionAnalyzer.
@@ -30,6 +32,8 @@ class ConstantExpressionTemplate : boost::noncopyable
         static void addNodesToCastResult(const IDataType & result_column_type, ASTPtr & expr, bool null_as_default);
         static size_t getTemplateHash(const ASTPtr & expression, const LiteralsInfo & replaced_literals,
                                       const DataTypePtr & result_column_type, bool null_as_default, const String & salt);
+
+        String dumpTemplate() const;
 
         String result_column_name;
 
@@ -90,7 +94,6 @@ private:
     bool parseLiteralAndAssertType(
         ReadBuffer & istr, const TokenIterator & token_iterator, const IDataType * type, size_t column_idx, const Settings & settings);
 
-private:
     TemplateStructurePtr structure;
     MutableColumns columns;
 

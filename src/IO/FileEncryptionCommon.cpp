@@ -1,17 +1,20 @@
 #include <IO/FileEncryptionCommon.h>
 
 #if USE_SSL
-#include <IO/ReadBuffer.h>
-#include <IO/ReadHelpers.h>
-#include <IO/WriteBuffer.h>
-#include <IO/WriteHelpers.h>
-#include <Common/SipHash.h>
-#include <Common/safe_cast.h>
+#    include <base/MemorySanitizer.h>
+#    include <IO/ReadBuffer.h>
+#    include <IO/ReadHelpers.h>
+#    include <IO/WriteBuffer.h>
+#    include <IO/WriteHelpers.h>
+#    include <Common/SipHash.h>
+#    include <Common/OpenSSLHelpers.h>
+#    include <Common/safe_cast.h>
 
-#include <boost/algorithm/string/predicate.hpp>
-#include <cassert>
-#include <random>
+#    include <cassert>
+#    include <boost/algorithm/string/predicate.hpp>
 
+#    include <openssl/err.h>
+#    include <openssl/rand.h>
 
 namespace DB
 {
@@ -20,6 +23,7 @@ namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int DATA_ENCRYPTION_ERROR;
+    extern const int OPENSSL_ERROR;
 }
 
 namespace FileEncryption
@@ -94,8 +98,10 @@ namespace
 
             uint8_t * ciphertext = reinterpret_cast<uint8_t *>(out.position());
             int ciphertext_size = 0;
-            if (!EVP_EncryptUpdate(evp_ctx, ciphertext, &ciphertext_size, &in[in_size], static_cast<int>(part_size)))
-                throw Exception(ErrorCodes::DATA_ENCRYPTION_ERROR, "Failed to encrypt");
+            if (EVP_EncryptUpdate(evp_ctx, ciphertext, &ciphertext_size, &in[in_size], static_cast<int>(part_size)) != 1)
+                throw Exception(ErrorCodes::OPENSSL_ERROR, "EVP_EncryptUpdate failed: {}", getOpenSSLErrors());
+
+            __msan_unpoison(ciphertext, ciphertext_size); /// OpenSSL uses assembly which evades msans analysis
 
             in_size += part_size;
             if (ciphertext_size)
@@ -117,8 +123,8 @@ namespace
 
         uint8_t ciphertext[kBlockSize];
         int ciphertext_size = 0;
-        if (!EVP_EncryptUpdate(evp_ctx, ciphertext, &ciphertext_size, padded_data, safe_cast<int>(padded_data_size)))
-            throw Exception(ErrorCodes::DATA_ENCRYPTION_ERROR, "Failed to encrypt");
+        if (EVP_EncryptUpdate(evp_ctx, ciphertext, &ciphertext_size, padded_data, safe_cast<int>(padded_data_size)) != 1)
+            throw Exception(ErrorCodes::OPENSSL_ERROR, "EVP_EncryptUpdate failed: {}", getOpenSSLErrors());
 
         if (!ciphertext_size)
             return 0;
@@ -128,6 +134,7 @@ namespace
 
         uint8_t * ciphertext_begin = &ciphertext[pad_left];
         ciphertext_size -= pad_left;
+        __msan_unpoison(ciphertext_begin, ciphertext_size); /// OpenSSL uses assembly which evades msans analysis
         out.write(reinterpret_cast<const char *>(ciphertext_begin), ciphertext_size);
         return ciphertext_size;
     }
@@ -136,9 +143,9 @@ namespace
     {
         uint8_t ciphertext[kBlockSize];
         int ciphertext_size = 0;
-        if (!EVP_EncryptFinal_ex(evp_ctx,
-                                 ciphertext, &ciphertext_size))
-            throw Exception(ErrorCodes::DATA_ENCRYPTION_ERROR, "Failed to finalize encrypting");
+        if (EVP_EncryptFinal_ex(evp_ctx, ciphertext, &ciphertext_size) != 1)
+            throw Exception(ErrorCodes::OPENSSL_ERROR, "EVP_EncryptFinal_ex: {}", getOpenSSLErrors());
+        __msan_unpoison(ciphertext, ciphertext_size); /// OpenSSL uses assembly which evades msans analysis
         if (ciphertext_size)
             out.write(reinterpret_cast<const char *>(ciphertext), ciphertext_size);
         return ciphertext_size;
@@ -149,8 +156,9 @@ namespace
         const uint8_t * in = reinterpret_cast<const uint8_t *>(data);
         uint8_t * plaintext = reinterpret_cast<uint8_t *>(out);
         int plaintext_size = 0;
-        if (!EVP_DecryptUpdate(evp_ctx, plaintext, &plaintext_size, in, safe_cast<int>(size)))
-            throw Exception(ErrorCodes::DATA_ENCRYPTION_ERROR, "Failed to decrypt");
+        if (EVP_DecryptUpdate(evp_ctx, plaintext, &plaintext_size, in, safe_cast<int>(size)) != 1)
+            throw Exception(ErrorCodes::OPENSSL_ERROR, "EVP_DecryptUpdate: {}", getOpenSSLErrors());
+        __msan_unpoison(plaintext, plaintext_size); /// OpenSSL uses assembly which evades msans analysis
         return plaintext_size;
     }
 
@@ -162,8 +170,8 @@ namespace
         size_t padded_data_size = pad_left + size;
         uint8_t plaintext[kBlockSize];
         int plaintext_size = 0;
-        if (!EVP_DecryptUpdate(evp_ctx, plaintext, &plaintext_size, padded_data, safe_cast<int>(padded_data_size)))
-            throw Exception(ErrorCodes::DATA_ENCRYPTION_ERROR, "Failed to decrypt");
+        if (EVP_DecryptUpdate(evp_ctx, plaintext, &plaintext_size, padded_data, safe_cast<int>(padded_data_size)) != 1)
+            throw Exception(ErrorCodes::OPENSSL_ERROR, "EVP_DecryptUpdate: {}", getOpenSSLErrors());
 
         if (!plaintext_size)
             return 0;
@@ -173,6 +181,7 @@ namespace
 
         const uint8_t * plaintext_begin = &plaintext[pad_left];
         plaintext_size -= pad_left;
+        __msan_unpoison(plaintext_begin, plaintext_size); /// OpenSSL uses assembly which evades msans analysis
         memcpy(out, plaintext_begin, plaintext_size);
         return plaintext_size;
     }
@@ -181,8 +190,9 @@ namespace
     {
         uint8_t plaintext[kBlockSize];
         int plaintext_size = 0;
-        if (!EVP_DecryptFinal_ex(evp_ctx, plaintext, &plaintext_size))
-            throw Exception(ErrorCodes::DATA_ENCRYPTION_ERROR, "Failed to finalize decrypting");
+        if (EVP_DecryptFinal_ex(evp_ctx, plaintext, &plaintext_size) != 1)
+            throw Exception(ErrorCodes::OPENSSL_ERROR, "EVP_DecryptFinal_ex: {}", getOpenSSLErrors());
+        __msan_unpoison(plaintext, plaintext_size); /// OpenSSL uses assembly which evades msans analysis
         if (plaintext_size)
             memcpy(out, plaintext, plaintext_size);
         return plaintext_size;
@@ -216,15 +226,14 @@ Algorithm parseAlgorithmFromString(const String & str)
 {
     if (boost::iequals(str, "aes_128_ctr"))
         return Algorithm::AES_128_CTR;
-    else if (boost::iequals(str, "aes_192_ctr"))
+    if (boost::iequals(str, "aes_192_ctr"))
         return Algorithm::AES_192_CTR;
-    else if (boost::iequals(str, "aes_256_ctr"))
+    if (boost::iequals(str, "aes_256_ctr"))
         return Algorithm::AES_256_CTR;
-    else
-        throw Exception(
-            ErrorCodes::BAD_ARGUMENTS,
-            "Encryption algorithm '{}' is not supported, specify one of the following: aes_128_ctr, aes_192_ctr, aes_256_ctr",
-            str);
+    throw Exception(
+        ErrorCodes::BAD_ARGUMENTS,
+        "Encryption algorithm '{}' is not supported, specify one of the following: aes_128_ctr, aes_192_ctr, aes_256_ctr",
+        str);
 }
 
 void checkKeySize(size_t key_size, Algorithm algorithm) { checkKeySize(getCipher(algorithm), key_size); }
@@ -260,12 +269,10 @@ void InitVector::write(WriteBuffer & out) const
 
 InitVector InitVector::random()
 {
-    std::random_device rd;
-    std::mt19937 gen{rd()};
-    std::uniform_int_distribution<UInt128::base_type> dis;
     UInt128 counter;
-    for (auto & i : counter.items)
-        i = dis(gen);
+    auto * buf = reinterpret_cast<unsigned char *>(counter.items);
+    if (RAND_bytes(buf, sizeof(counter.items)) != 1)
+        throw Exception(DB::ErrorCodes::OPENSSL_ERROR, "RAND_bytes failed: {}", getOpenSSLErrors());
     return InitVector{counter};
 }
 
@@ -289,12 +296,12 @@ void Encryptor::encrypt(const char * data, size_t size, WriteBuffer & out)
     auto evp_ctx_ptr = std::unique_ptr<EVP_CIPHER_CTX, decltype(&::EVP_CIPHER_CTX_free)>(EVP_CIPHER_CTX_new(), &EVP_CIPHER_CTX_free);
     auto * evp_ctx = evp_ctx_ptr.get();
 
-    if (!EVP_EncryptInit_ex(evp_ctx, evp_cipher, nullptr, nullptr, nullptr))
-        throw Exception(ErrorCodes::DATA_ENCRYPTION_ERROR, "Failed to initialize encryption context with cipher");
+    if (EVP_EncryptInit_ex(evp_ctx, evp_cipher, nullptr, nullptr, nullptr) != 1)
+        throw Exception(DB::ErrorCodes::OPENSSL_ERROR, "EVP_EncryptInit_ex failed: {}", getOpenSSLErrors());
 
-    if (!EVP_EncryptInit_ex(evp_ctx, nullptr, nullptr,
-                            reinterpret_cast<const uint8_t*>(key.c_str()), reinterpret_cast<const uint8_t*>(current_iv.c_str())))
-        throw Exception(ErrorCodes::DATA_ENCRYPTION_ERROR, "Failed to set key and IV for encryption");
+    if (EVP_EncryptInit_ex(evp_ctx, nullptr, nullptr,
+                            reinterpret_cast<const uint8_t*>(key.c_str()), reinterpret_cast<const uint8_t*>(current_iv.c_str())) != 1)
+        throw Exception(DB::ErrorCodes::OPENSSL_ERROR, "EVP_EncryptInit_ex failed: {}", getOpenSSLErrors());
 
     size_t in_size = 0;
     size_t out_size = 0;
@@ -319,7 +326,7 @@ void Encryptor::encrypt(const char * data, size_t size, WriteBuffer & out)
     out_size += encryptFinal(evp_ctx, out);
 
     if (out_size != in_size)
-        throw Exception(ErrorCodes::DATA_ENCRYPTION_ERROR, "Only part of the data was encrypted");
+        throw Exception(ErrorCodes::DATA_ENCRYPTION_ERROR, "Only part of the data was encrypted: {} out of {} bytes", out_size, in_size);
     offset += in_size;
 }
 
@@ -333,12 +340,12 @@ void Encryptor::decrypt(const char * data, size_t size, char * out)
     auto evp_ctx_ptr = std::unique_ptr<EVP_CIPHER_CTX, decltype(&::EVP_CIPHER_CTX_free)>(EVP_CIPHER_CTX_new(), &EVP_CIPHER_CTX_free);
     auto * evp_ctx = evp_ctx_ptr.get();
 
-    if (!EVP_DecryptInit_ex(evp_ctx, evp_cipher, nullptr, nullptr, nullptr))
-        throw Exception(ErrorCodes::DATA_ENCRYPTION_ERROR, "Failed to initialize decryption context with cipher");
+    if (EVP_DecryptInit_ex(evp_ctx, evp_cipher, nullptr, nullptr, nullptr) != 1)
+        throw Exception(DB::ErrorCodes::OPENSSL_ERROR, "EVP_DecryptInit_ex failed: {}", getOpenSSLErrors());
 
-    if (!EVP_DecryptInit_ex(evp_ctx, nullptr, nullptr,
-                            reinterpret_cast<const uint8_t*>(key.c_str()), reinterpret_cast<const uint8_t*>(current_iv.c_str())))
-        throw Exception(ErrorCodes::DATA_ENCRYPTION_ERROR, "Failed to set key and IV for decryption");
+    if (EVP_DecryptInit_ex(evp_ctx, nullptr, nullptr,
+                            reinterpret_cast<const uint8_t*>(key.c_str()), reinterpret_cast<const uint8_t*>(current_iv.c_str())) != 1)
+        throw Exception(DB::ErrorCodes::OPENSSL_ERROR, "EVP_DecryptInit_ex failed: {}", getOpenSSLErrors());
 
     size_t in_size = 0;
     size_t out_size = 0;
@@ -363,7 +370,7 @@ void Encryptor::decrypt(const char * data, size_t size, char * out)
     out_size += decryptFinal(evp_ctx, &out[out_size]);
 
     if (out_size != in_size)
-        throw Exception(ErrorCodes::DATA_ENCRYPTION_ERROR, "Only part of the data was decrypted");
+        throw Exception(ErrorCodes::DATA_ENCRYPTION_ERROR, "Only part of the data was decrypted: {} out of {} bytes", out_size, in_size);
     offset += in_size;
 }
 

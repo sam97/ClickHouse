@@ -7,10 +7,10 @@
 #include <Parsers/ExpressionElementParsers.h>
 #include <Parsers/IParser.h>
 #include <Parsers/TokenIterator.h>
-#include <base/types.h>
 #include <Common/PODArray.h>
 #include <Common/Stopwatch.h>
 
+#include <Compression/ICompressionCodec.h>
 #include <Compression/LZ4_decompress_faster.h>
 #include <IO/BufferWithOwnMemory.h>
 
@@ -36,9 +36,7 @@ using namespace DB;
 namespace
 {
 
-template <class T> using is_pod = std::is_trivial<std::is_standard_layout<T>>;
-template <class T> inline constexpr bool is_pod_v = is_pod<T>::value;
-
+template <class T> inline constexpr bool is_pod_v = std::is_trivial_v<std::is_standard_layout<T>>;
 
 template <typename T>
 struct AsHexStringHelper
@@ -444,7 +442,7 @@ CompressionCodecPtr makeCodec(const std::string & codec_string, const DataTypePt
 {
     const std::string codec_statement = "(" + codec_string + ")";
     Tokens tokens(codec_statement.begin().base(), codec_statement.end().base());
-    IParser::Pos token_iterator(tokens, 0);
+    IParser::Pos token_iterator(tokens, 0, 0);
 
     Expected expected;
     ASTPtr codec_ast;
@@ -485,7 +483,7 @@ void testTranscoding(Timer & timer, ICompressionCodec & codec, const CodecTestSe
 
     ASSERT_TRUE(EqualByteContainers(test_sequence.data_type->getSizeOfValueInMemory(), source_data, decoded));
 
-    const auto header_size = codec.getHeaderSize();
+    const auto header_size = ICompressionCodec::getHeaderSize();
     const auto compression_ratio = (encoded_size - header_size) / (source_data.size() * 1.0);
 
     if (expected_compression_ratio)
@@ -524,7 +522,7 @@ public:
 TEST_P(CodecTest, TranscodingWithDataType)
 {
     /// Gorilla can only be applied to floating point columns
-    bool codec_is_gorilla = std::get<0>(GetParam()).codec_statement.find("Gorilla") != std::string::npos;
+    bool codec_is_gorilla = std::get<0>(GetParam()).codec_statement.contains("Gorilla");
     WhichDataType which(std::get<1>(GetParam()).data_type.get());
     bool data_is_float = which.isFloat();
     if (codec_is_gorilla && !data_is_float)
@@ -704,7 +702,7 @@ struct MonotonicGenerator // NOLINT
     explicit MonotonicGenerator(T stride_ = 1, T max_step = 10) // NOLINT
         : prev_value(0),
           stride(stride_),
-          random_engine(0),
+          random_engine(0), /// NOLINT
           distribution(0, max_step)
     {}
 
@@ -741,6 +739,11 @@ private:
     std::default_random_engine random_engine;
     uniform_distribution<T> distribution;
 };
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
+MonotonicGenerator() -> MonotonicGenerator<Int32>;
+#pragma clang diagnostic pop
 
 auto RandomishGenerator = [](auto i)
 {
@@ -796,7 +799,7 @@ std::vector<CodecTestSequence> generatePyramidOfSequences(const size_t sequences
     for (size_t i = 1; i < sequences_count; ++i)
     {
         std::string name = generator_name + std::string(" from 0 to ") + std::to_string(i);
-        sequences.push_back(generateSeq<T>(std::forward<decltype(generator)>(generator), name.c_str(), 0, i));
+        sequences.push_back(generateSeq<T>(generator, name.c_str(), 0, i));
     }
 
     return sequences;
@@ -1120,6 +1123,22 @@ INSTANTIATE_TEST_SUITE_P(OverflowFloat,
     )
 );
 
+/// Size of data after ZSTD is not a multiple of 8,
+/// and may break DoubleDelta.
+INSTANTIATE_TEST_SUITE_P(DoubleDeltaUnalignedTranscode,
+    CodecTest,
+    ::testing::Combine(
+        ::testing::Values(
+            Codec("ZSTD, DoubleDelta")
+        ),
+        ::testing::Values(
+            makeSeq<Float64>(0, 1),
+            makeSeq<Float64>(1, 0)
+        )
+    )
+);
+
+
 template <typename ValueType>
 auto DDCompatibilityTestSequence()
 {
@@ -1303,6 +1322,90 @@ TEST(LZ4Test, DecompressMalformedInput)
 
     auto codec = CompressionCodecFactory::instance().get("LZ4", {});
     ASSERT_THROW(codec->decompress(source, source_size, memory.data()), Exception);
+}
+
+TEST(DoubleDeltaTest, TranscodeRawInput)
+{
+    std::vector<DataTypePtr> types = {
+        std::make_shared<DataTypeInt8>(),
+        std::make_shared<DataTypeInt16>(),
+        std::make_shared<DataTypeInt32>(),
+        std::make_shared<DataTypeInt64>(),
+        std::make_shared<DataTypeUInt8>(),
+        std::make_shared<DataTypeUInt16>(),
+        std::make_shared<DataTypeUInt32>(),
+        std::make_shared<DataTypeUInt64>(),
+        std::make_shared<DataTypeFloat32>(),
+        std::make_shared<DataTypeFloat64>(),
+    };
+
+    for (const auto & type : types)
+    {
+        for (size_t buffer_size = 1; buffer_size < 40; buffer_size++)
+        {
+            DB::Memory<> source_memory;
+            source_memory.resize(buffer_size);
+
+            for (size_t i = 0; i < buffer_size; ++i)
+                source_memory.data()[i] = i;
+
+            DB::Memory<> memory_for_compression;
+            memory_for_compression.resize(ICompressionCodec::getHeaderSize() + buffer_size);
+
+            auto codec = makeCodec("DoubleDelta", type);
+
+            auto compressed = codec->compress(source_memory.data(), UInt32(source_memory.size()), memory_for_compression.data());
+
+            DB::Memory<> memory_for_decompression;
+            memory_for_decompression.resize(buffer_size);
+            auto decompressed = codec->decompress(memory_for_compression.data(), compressed, memory_for_decompression.data());
+
+            ASSERT_EQ(decompressed, source_memory.size());
+            for (size_t i = 0; i < decompressed; ++i)
+                ASSERT_EQ(memory_for_decompression.data()[i], source_memory.data()[i]) << "with data type " << type->getName() << " with buffer size " << buffer_size << " at position " << i;
+        }
+    }
+}
+
+TEST(T64Test, TranscodeRawInput)
+{
+    std::vector<DataTypePtr> types = {
+        std::make_shared<DataTypeInt8>(),
+        std::make_shared<DataTypeInt16>(),
+        std::make_shared<DataTypeInt32>(),
+        std::make_shared<DataTypeInt64>(),
+        std::make_shared<DataTypeUInt8>(),
+        std::make_shared<DataTypeUInt16>(),
+        std::make_shared<DataTypeUInt32>(),
+        std::make_shared<DataTypeUInt64>(),
+    };
+
+    for (const auto & type : types)
+    {
+        for (size_t buffer_size = 1; buffer_size < 2000; buffer_size++)
+        {
+            DB::Memory<> source_memory;
+            source_memory.resize(buffer_size);
+
+            for (size_t i = 0; i < buffer_size; ++i)
+                source_memory.data()[i] = i;
+
+            DB::Memory<> memory_for_compression;
+            auto codec = makeCodec("T64", type);
+
+            memory_for_compression.resize(codec->getCompressedReserveSize(buffer_size));
+
+            auto compressed = codec->compress(source_memory.data(), UInt32(source_memory.size()), memory_for_compression.data());
+
+            DB::Memory<> memory_for_decompression;
+            memory_for_decompression.resize(buffer_size);
+            auto decompressed = codec->decompress(memory_for_compression.data(), compressed, memory_for_decompression.data());
+
+            ASSERT_EQ(decompressed, source_memory.size());
+            for (size_t i = 0; i < decompressed; ++i)
+                ASSERT_EQ(memory_for_decompression.data()[i], source_memory.data()[i]) << "with data type " << type->getName() << " with buffer size " << buffer_size << " at position " << i;
+        }
+    }
 }
 
 }

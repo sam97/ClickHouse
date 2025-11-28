@@ -8,7 +8,7 @@
 #include <IO/ReadBufferFromFileBase.h>
 #include <IO/ReadSettings.h>
 #include <IO/WithFileName.h>
-#include <azure/storage/blobs.hpp>
+#include <Disks/DiskObjectStorage/ObjectStorages/AzureBlobStorage/AzureBlobStorageCommon.h>
 
 namespace DB
 {
@@ -16,14 +16,17 @@ namespace DB
 class ReadBufferFromAzureBlobStorage : public ReadBufferFromFileBase
 {
 public:
+    using ContainerClientPtr = std::shared_ptr<const AzureBlobStorage::ContainerClient>;
+    using BlobClientPtr = std::unique_ptr<const AzureBlobStorage::BlobClient>;
 
     ReadBufferFromAzureBlobStorage(
-        std::shared_ptr<const Azure::Storage::Blobs::BlobContainerClient> blob_container_client_,
+        ContainerClientPtr blob_container_client_,
         const String & path_,
         const ReadSettings & read_settings_,
         size_t max_single_read_retries_,
         size_t max_single_download_retries_,
         bool use_external_buffer_ = false,
+        bool restricted_seek_ = false,
         size_t read_until_position_ = 0);
 
     off_t seek(off_t off, int whence) override;
@@ -37,16 +40,28 @@ public:
     String getFileName() const override { return path; }
 
     void setReadUntilPosition(size_t position) override;
+    void setReadUntilEnd() override;
 
     bool supportsRightBoundedReads() const override { return true; }
 
-private:
+    std::optional<size_t> tryGetFileSize() override;
 
-    void initialize();
+    size_t readBigAt(char * to, size_t n, size_t range_begin, const std::function<bool(size_t)> & progress_callback) const override;
+
+    bool supportsReadAt() override { return true; }
+
+    /// Buffer may issue several requests, so theoretically metadata may be different for different requests.
+    /// This method returns metadata from the last request. If there were no requests, it will throw exception.
+    ObjectMetadata getObjectMetadataFromTheLastRequest() const;
+
+private:
+    void initialize(size_t attempt);
+    void setMetadataFromResponse(const Azure::Storage::Blobs::Models::DownloadBlobDetails & details, size_t blob_size) const;
 
     std::unique_ptr<Azure::Core::IO::BodyStream> data_stream;
-    std::shared_ptr<const Azure::Storage::Blobs::BlobContainerClient> blob_container_client;
-    std::unique_ptr<Azure::Storage::Blobs::BlobClient> blob_client;
+    Azure::Core::Context azure_context;
+    ContainerClientPtr blob_container_client;
+    BlobClientPtr blob_client;
 
     const String path;
     size_t max_single_read_retries;
@@ -55,6 +70,11 @@ private:
     std::vector<char> tmp_buffer;
     size_t tmp_buffer_size;
     bool use_external_buffer;
+
+    /// There is different seek policy for disk seek and for non-disk seek
+    /// (non-disk seek is applied for seekable input formats: orc, arrow, parquet).
+    bool restricted_seek;
+
     off_t read_until_position = 0;
 
     off_t offset = 0;
@@ -63,7 +83,9 @@ private:
     char * data_ptr;
     size_t data_capacity;
 
-    Poco::Logger * log = &Poco::Logger::get("ReadBufferFromAzureBlobStorage");
+    LoggerPtr log = getLogger("ReadBufferFromAzureBlobStorage");
+    /// No-way to make metadata non-mutable, because readBig method is const.
+    mutable std::optional<ObjectMetadata> last_object_metadata;
 };
 
 }

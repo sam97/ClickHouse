@@ -1,6 +1,10 @@
 ---
-slug: /en/sql-reference/aggregate-functions/reference/grouparray
-sidebar_position: 110
+description: 'Creates an array of argument values. Values can be added to the array
+  in any (indeterminate) order.'
+sidebar_position: 139
+slug: /sql-reference/aggregate-functions/reference/grouparray
+title: 'groupArray'
+doc_type: 'reference'
 ---
 
 # groupArray
@@ -12,11 +16,11 @@ Values can be added to the array in any (indeterminate) order.
 
 The second version (with the `max_size` parameter) limits the size of the resulting array to `max_size` elements. For example, `groupArray(1)(x)` is equivalent to `[any (x)]`.
 
-In some cases, you can still rely on the order of execution. This applies to cases when `SELECT` comes from a subquery that uses `ORDER BY`.
+In some cases, you can still rely on the order of execution. This applies to cases when `SELECT` comes from a subquery that uses `ORDER BY` if the subquery result is small enough.
 
 **Example**
 
-``` text
+```text
 SELECT * FROM default.ck;
 
 ┌─id─┬─name─────┐
@@ -30,13 +34,13 @@ SELECT * FROM default.ck;
 
 Query:
 
-``` sql
-select id, groupArray(10)(name) from default.ck group by id;
+```sql
+SELECT id, groupArray(10)(name) FROM default.ck GROUP BY id;
 ```
 
 Result:
 
-``` text
+```text
 ┌─id─┬─groupArray(10)(name)─┐
 │  1 │ ['zhangsan','lisi']  │
 │  2 │ ['wangwu']           │
@@ -44,3 +48,5 @@ Result:
 ```
 
 The groupArray function will remove ᴺᵁᴸᴸ value based on the above results.
+
+- Alias: `array_agg`.

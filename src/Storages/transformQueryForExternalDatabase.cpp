@@ -1,5 +1,6 @@
 #include <Common/typeid_cast.h>
 #include <Columns/ColumnConst.h>
+#include <Core/Settings.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Parsers/IAST.h>
 #include <Parsers/ASTFunction.h>
@@ -13,12 +14,17 @@
 #include <IO/WriteBufferFromString.h>
 #include <Storages/transformQueryForExternalDatabase.h>
 #include <Storages/MergeTree/KeyCondition.h>
-
 #include <Storages/transformQueryForExternalDatabaseAnalyzer.h>
+
+#include <queue>
 
 
 namespace DB
 {
+namespace Setting
+{
+    extern const SettingsBool external_table_strict_query;
+}
 
 namespace ErrorCodes
 {
@@ -49,7 +55,7 @@ public:
         std::string name = node->getColumnName();
         if (block_with_constants.has(name))
         {
-            auto result = block_with_constants.getByName(name);
+            const auto & result = block_with_constants.getByName(name);
             if (!isColumnConst(*result.column))
                 return;
 
@@ -74,6 +80,33 @@ public:
         }
     }
 };
+
+struct ReplaceLiteralToExprVisitorData
+{
+    using TypeToVisit = ASTFunction;
+
+    void visit(ASTFunction & func, ASTPtr &) const
+    {
+        if (func.name == "and" || func.name == "or")
+        {
+            for (auto & argument : func.arguments->children)
+            {
+                auto * literal_expr = typeid_cast<ASTLiteral *>(argument.get());
+                UInt64 value;
+                if (literal_expr && literal_expr->value.tryGet<UInt64>(value) && (value == 0 || value == 1))
+                {
+                    /// 1 -> 1=1, 0 -> 1=0.
+                    if (value)
+                        argument = makeASTOperator("equals", std::make_shared<ASTLiteral>(1), std::make_shared<ASTLiteral>(1));
+                    else
+                        argument = makeASTOperator("equals", std::make_shared<ASTLiteral>(1), std::make_shared<ASTLiteral>(0));
+                }
+            }
+        }
+    }
+};
+
+using ReplaceLiteralToExprVisitor = InDepthNodeVisitor<OneTypeMatcher<ReplaceLiteralToExprVisitorData>, true>;
 
 class DropAliasesMatcher
 {
@@ -118,7 +151,7 @@ bool isCompatible(ASTPtr & node)
             return false;
 
         if (!function->arguments)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Logical error: function->arguments is not set");
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "function->arguments is not set");
 
         String name = function->name;
 
@@ -159,6 +192,9 @@ bool isCompatible(ASTPtr & node)
         for (auto & expr : function->arguments->children)
             if (!isCompatible(expr))
                 return false;
+
+        /// It should be formatted in the operator form.
+        function->is_operator = true;
 
         return true;
     }
@@ -258,11 +294,13 @@ String transformQueryForExternalDatabaseImpl(
     Names used_columns,
     const NamesAndTypesList & available_columns,
     IdentifierQuotingStyle identifier_quoting_style,
+    LiteralEscapingStyle literal_escaping_style,
     const String & database,
     const String & table,
-    ContextPtr context)
+    ContextPtr context,
+    std::optional<size_t> limit)
 {
-    bool strict = context->getSettingsRef().external_table_strict_query;
+    bool strict = context->getSettingsRef()[Setting::external_table_strict_query];
 
     auto select = std::make_shared<ASTSelectQuery>();
 
@@ -287,6 +325,10 @@ String transformQueryForExternalDatabaseImpl(
     {
         replaceConstantExpressions(original_where, context, available_columns);
 
+        /// Replace like WHERE 1 AND 1 to WHERE 1 = 1 AND 1 = 1
+        ReplaceLiteralToExprVisitor::Data replace_literal_to_expr_data;
+        ReplaceLiteralToExprVisitor(replace_literal_to_expr_data).visit(original_where);
+
         if (isCompatible(original_where))
         {
             select->setExpression(ASTSelectQuery::Expression::WHERE, std::move(original_where));
@@ -297,14 +339,26 @@ String transformQueryForExternalDatabaseImpl(
         }
         else if (auto * function = original_where->as<ASTFunction>())
         {
-            if (function->name == "and")
+            if (function->name == "and" || function->name == "tuple")
             {
-                auto new_function_and = makeASTFunction("and");
-                for (auto & elem : function->arguments->children)
+                auto new_function_and = makeASTOperator("and");
+                std::queue<const ASTFunction *> predicates;
+                predicates.push(function);
+
+                while (!predicates.empty())
                 {
-                    if (isCompatible(elem))
-                        new_function_and->arguments->children.push_back(elem);
+                    const auto * func = predicates.front();
+                    predicates.pop();
+
+                    for (auto & elem : func->arguments->children)
+                    {
+                        if (isCompatible(elem))
+                            new_function_and->arguments->children.push_back(elem);
+                        else if (const auto * child = elem->as<ASTFunction>(); child && (child->name == "and" || child->name == "tuple"))
+                            predicates.push(child);
+                    }
                 }
+
                 if (new_function_and->arguments->children.size() == 1)
                     select->setExpression(ASTSelectQuery::Expression::WHERE, std::move(new_function_and->arguments->children[0]));
                 else if (new_function_and->arguments->children.size() > 1)
@@ -324,21 +378,27 @@ String transformQueryForExternalDatabaseImpl(
     {
         /// WHERE 1 -> WHERE 1=1, WHERE 0 -> WHERE 1=0.
         if (value)
-            original_where = makeASTFunction("equals", std::make_shared<ASTLiteral>(1), std::make_shared<ASTLiteral>(1));
+            original_where = makeASTOperator("equals", std::make_shared<ASTLiteral>(1), std::make_shared<ASTLiteral>(1));
         else
-            original_where = makeASTFunction("equals", std::make_shared<ASTLiteral>(1), std::make_shared<ASTLiteral>(0));
+            original_where = makeASTOperator("equals", std::make_shared<ASTLiteral>(1), std::make_shared<ASTLiteral>(0));
         select->setExpression(ASTSelectQuery::Expression::WHERE, std::move(original_where));
     }
 
+    if (limit)
+        select->setExpression(ASTSelectQuery::Expression::LIMIT_LENGTH, std::make_shared<ASTLiteral>(*limit));
+
     ASTPtr select_ptr = select;
     dropAliases(select_ptr);
-
+    IdentifierQuotingRule identifier_quoting_rule = IdentifierQuotingRule::Always;
     WriteBufferFromOwnString out;
-    IAST::FormatSettings settings(out, true);
-    settings.identifier_quoting_style = identifier_quoting_style;
-    settings.always_quote_identifiers = identifier_quoting_style != IdentifierQuotingStyle::None;
+    IAST::FormatSettings settings(
+        /*one_line=*/true,
+        /*identifier_quoting_rule=*/identifier_quoting_rule,
+        /*identifier_quoting_style=*/identifier_quoting_style,
+        /*show_secrets_=*/true,
+        /*literal_escaping_style=*/literal_escaping_style);
 
-    select->format(settings);
+    select->format(out, settings);
 
     return out.str();
 }
@@ -350,9 +410,11 @@ String transformQueryForExternalDatabase(
     const Names & column_names,
     const NamesAndTypesList & available_columns,
     IdentifierQuotingStyle identifier_quoting_style,
+    LiteralEscapingStyle literal_escaping_style,
     const String & database,
     const String & table,
-    ContextPtr context)
+    ContextPtr context,
+    std::optional<size_t> limit)
 {
     if (!query_info.syntax_analyzer_result)
     {
@@ -367,16 +429,18 @@ String transformQueryForExternalDatabase(
             throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "No column names for query '{}' to external table '{}.{}'",
                             query_info.query_tree->formatASTForErrorMessage(), database, table);
 
-        auto clone_query = getASTForExternalDatabaseFromQueryTree(query_info.query_tree);
+        auto clone_query = getASTForExternalDatabaseFromQueryTree(context, query_info.query_tree, query_info.table_expression);
 
         return transformQueryForExternalDatabaseImpl(
             clone_query,
             column_names,
             available_columns,
             identifier_quoting_style,
+            literal_escaping_style,
             database,
             table,
-            context);
+            context,
+            limit);
     }
 
     auto clone_query = query_info.query->clone();
@@ -385,9 +449,11 @@ String transformQueryForExternalDatabase(
         query_info.syntax_analyzer_result->requiredSourceColumns(),
         available_columns,
         identifier_quoting_style,
+        literal_escaping_style,
         database,
         table,
-        context);
+        context,
+        limit);
 }
 
 }

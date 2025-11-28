@@ -1,3 +1,4 @@
+#include <Formats/FormatFactory.h>
 #include <Processors/Formats/Impl/MsgPackRowInputFormat.h>
 
 #if USE_MSGPACK
@@ -47,17 +48,28 @@ namespace ErrorCodes
     extern const int UNEXPECTED_END_OF_FILE;
 }
 
-MsgPackRowInputFormat::MsgPackRowInputFormat(const Block & header_, ReadBuffer & in_, Params params_, const FormatSettings & settings)
+MsgPackRowInputFormat::MsgPackRowInputFormat(SharedHeader header_, ReadBuffer & in_, Params params_, const FormatSettings & settings)
     : MsgPackRowInputFormat(header_, std::make_unique<PeekableReadBuffer>(in_), params_, settings) {}
 
-MsgPackRowInputFormat::MsgPackRowInputFormat(const Block & header_, std::unique_ptr<PeekableReadBuffer> buf_, Params params_, const FormatSettings & settings)
-    : IRowInputFormat(header_, *buf_, std::move(params_)), buf(std::move(buf_)), visitor(settings.null_as_default), parser(visitor), data_types(header_.getDataTypes())  {}
+MsgPackRowInputFormat::MsgPackRowInputFormat(SharedHeader header_, std::unique_ptr<PeekableReadBuffer> buf_, Params params_, const FormatSettings & settings)
+    : IRowInputFormat(header_, *buf_, std::move(params_)), buf(std::move(buf_)), visitor(settings.null_as_default), parser(visitor), data_types(header_->getDataTypes())  {}
 
 void MsgPackRowInputFormat::resetParser()
 {
     IRowInputFormat::resetParser();
-    buf->reset();
     visitor.reset();
+}
+
+void MsgPackRowInputFormat::setReadBuffer(ReadBuffer & in_)
+{
+    buf = std::make_unique<PeekableReadBuffer>(in_);
+    IRowInputFormat::setReadBuffer(*buf);
+}
+
+void MsgPackRowInputFormat::resetReadBuffer()
+{
+    buf.reset();
+    IRowInputFormat::resetReadBuffer();
 }
 
 void MsgPackVisitor::set_info(IColumn & column, DataTypePtr type, UInt8 & read) // NOLINT
@@ -244,7 +256,8 @@ static void insertString(IColumn & column, DataTypePtr type, const char * value,
             case TypeIndex::Decimal256:
                 insertFromBinaryRepresentation<ColumnDecimal<Decimal256>>(column, type, value, size);
                 return;
-            default:;
+            default:
+                break;
         }
     }
 
@@ -326,8 +339,8 @@ static void insertUUID(IColumn & column, DataTypePtr type, const char * value, s
         throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Cannot insert MessagePack UUID into column with type {}.", type->getName());
     ReadBufferFromMemory buf(value, size);
     UUID uuid;
-    readBinaryBigEndian(uuid.toUnderType().items[0], buf);
-    readBinaryBigEndian(uuid.toUnderType().items[1], buf);
+    readBinaryBigEndian(UUIDHelpers::getHighBytes(uuid), buf);
+    readBinaryBigEndian(UUIDHelpers::getLowBytes(uuid), buf);
     assert_cast<ColumnUUID &>(column).insertValue(uuid);
 }
 
@@ -394,8 +407,13 @@ bool MsgPackVisitor::start_array(size_t size) // NOLINT
 
         ColumnTuple & column_tuple = assert_cast<ColumnTuple &>(info_stack.top().column);
         /// Push nested columns into stack in reverse order.
-        for (ssize_t i = nested_types.size() - 1; i >= 0; --i)
+        for (ssize_t i = static_cast<ssize_t>(nested_types.size()) - 1; i >= 0; --i)
             info_stack.push(Info{column_tuple.getColumn(i), nested_types[i], true, std::nullopt, nullptr});
+
+        /// There are no nested columns to grow, so we must explicitly increment the column size.
+        /// Otherwise, `column.size()` will return 0 for empty tuples columns.
+        if (nested_types.empty())
+            column_tuple.addSize(1);
     }
     else
     {
@@ -482,14 +500,15 @@ void MsgPackVisitor::parse_error(size_t, size_t) // NOLINT
     throw Exception(ErrorCodes::INCORRECT_DATA, "Error occurred while parsing msgpack data.");
 }
 
-bool MsgPackRowInputFormat::readObject()
+template <typename Parser>
+bool MsgPackRowInputFormat::readObject(Parser & msgpack_parser)
 {
     if (buf->eof())
         return false;
 
     PeekableReadBufferCheckpoint checkpoint{*buf};
     size_t offset = 0;
-    while (!parser.execute(buf->position(), buf->available(), offset))
+    while (!msgpack_parser.execute(buf->position(), buf->available(), offset))
     {
         buf->position() = buf->buffer().end();
         if (buf->eof())
@@ -502,6 +521,24 @@ bool MsgPackRowInputFormat::readObject()
     return true;
 }
 
+size_t MsgPackRowInputFormat::countRows(size_t max_block_size)
+{
+    size_t num_rows = 0;
+    msgpack::null_visitor null_visitor;
+    msgpack::detail::parse_helper<msgpack::null_visitor> null_parser(null_visitor);
+
+    size_t columns = getPort().getHeader().columns();
+
+    while (!buf->eof() && num_rows < max_block_size)
+    {
+        for (size_t i = 0; i < columns; ++i)
+            readObject(null_parser);
+        ++num_rows;
+    }
+
+    return num_rows;
+}
+
 bool MsgPackRowInputFormat::readRow(MutableColumns & columns, RowReadExtension & ext)
 {
     size_t column_index = 0;
@@ -510,7 +547,7 @@ bool MsgPackRowInputFormat::readRow(MutableColumns & columns, RowReadExtension &
     for (; column_index != columns.size(); ++column_index)
     {
         visitor.set_info(*columns[column_index], data_types[column_index], ext.read_columns[column_index]);
-        has_more_data = readObject();
+        has_more_data = readObject(parser);
         if (!has_more_data)
             break;
     }
@@ -521,11 +558,6 @@ bool MsgPackRowInputFormat::readRow(MutableColumns & columns, RowReadExtension &
         return false;
     }
     return true;
-}
-
-void MsgPackRowInputFormat::setReadBuffer(ReadBuffer & in_)
-{
-    buf->setSubBuffer(in_);
 }
 
 MsgPackSchemaReader::MsgPackSchemaReader(ReadBuffer & in_, const FormatSettings & format_settings_)
@@ -631,10 +663,9 @@ DataTypePtr MsgPackSchemaReader::getDataType(const msgpack::object & object)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Msgpack extension type {:x} is not supported", object_ext.type());
         }
     }
-    UNREACHABLE();
 }
 
-DataTypes MsgPackSchemaReader::readRowAndGetDataTypes()
+std::optional<DataTypes> MsgPackSchemaReader::readRowAndGetDataTypes()
 {
     if (buf.eof())
         return {};
@@ -658,7 +689,7 @@ void registerInputFormatMsgPack(FormatFactory & factory)
             const RowInputFormatParams & params,
             const FormatSettings & settings)
     {
-        return std::make_shared<MsgPackRowInputFormat>(sample, buf, params, settings);
+        return std::make_shared<MsgPackRowInputFormat>(std::make_shared<const Block>(sample), buf, params, settings);
     });
     factory.registerFileExtension("messagepack", "MsgPack");
 }

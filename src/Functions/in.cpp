@@ -3,12 +3,10 @@
 #include <Functions/FunctionHelpers.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypesNumber.h>
-#include <DataTypes/DataTypeLowCardinality.h>
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnSet.h>
-#include <Columns/ColumnLowCardinality.h>
 #include <Interpreters/Set.h>
 
 
@@ -18,6 +16,7 @@ namespace ErrorCodes
 {
     extern const int ILLEGAL_COLUMN;
     extern const int LOGICAL_ERROR;
+    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
 }
 
 namespace
@@ -70,14 +69,11 @@ public:
         return 2;
     }
 
-    /// Do not use default implementation for LowCardinality.
-    /// For now, Set may be const or non const column, depending on how it was created.
-    /// But we will return UInt8 for any case.
-    /// TODO: we could use special implementation later.
-    bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
-
-    DataTypePtr getReturnTypeImpl(const DataTypes & /*arguments*/) const override
+    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
+        if (arguments[0]->hasDynamicSubcolumns())
+            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Illegal type {} of argument of function {}", arguments[0]->getName(), getName());
+
         return std::make_shared<DataTypeUInt8>();
     }
 
@@ -87,11 +83,26 @@ public:
         return !ignore_set;
     }
 
+    bool useDefaultImplementationForDynamic() const override
+    {
+        return false;
+    }
+
     bool useDefaultImplementationForNulls() const override { return null_is_skipped; }
 
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
-    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, [[maybe_unused]] size_t input_rows_count) const override
+    ColumnPtr executeImplDryRun(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
+    {
+        return executeImpl(arguments, true, input_rows_count);
+    }
+
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
+    {
+        return executeImpl(arguments, false, input_rows_count);
+    }
+
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, bool dry_run, size_t input_rows_count) const
     {
         if constexpr (ignore_set)
             return ColumnUInt8::create(input_rows_count, 0u);
@@ -122,9 +133,18 @@ public:
             tuple = typeid_cast<const ColumnTuple *>(materialized_tuple.get());
         }
 
-        auto set = column_set->getData();
+        auto future_set = column_set->getData();
+        if (!future_set)
+        {
+            if (dry_run)
+                return ColumnUInt8::create(input_rows_count, 0u);
+
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "No Set is passed as the second argument for function '{}'", getName());
+        }
+
+        auto set = future_set->get();
         if (!set)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Not-ready Set passed as the second argument for function '{}'", getName());
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Not-ready Set is passed as the second argument for function '{}'", getName());
 
         auto set_types = set->getDataTypes();
 
@@ -139,8 +159,6 @@ public:
         else
             columns_of_key_columns.emplace_back(left_arg);
 
-        /// Replace single LowCardinality column to it's dictionary if possible.
-        ColumnPtr lc_indexes = nullptr;
         bool is_const = false;
         if (columns_of_key_columns.size() == 1)
         {
@@ -151,19 +169,9 @@ public:
                 col = &const_col->getDataColumn();
                 is_const = true;
             }
-
-            if (const auto * lc = typeid_cast<const ColumnLowCardinality *>(col))
-            {
-                lc_indexes = lc->getIndexesPtr();
-                arg.column = lc->getDictionary().getNestedColumn();
-                arg.type = removeLowCardinality(arg.type);
-            }
         }
 
         auto res = set->execute(columns_of_key_columns, negative);
-
-        if (lc_indexes)
-            res = res->index(*lc_indexes, 0);
 
         if (is_const)
             res = ColumnUInt8::create(input_rows_count, res->getUInt(0));

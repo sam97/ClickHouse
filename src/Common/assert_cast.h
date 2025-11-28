@@ -1,5 +1,6 @@
 #pragma once
 
+#ifdef DEBUG_OR_SANITIZER_BUILD
 #include <type_traits>
 #include <typeinfo>
 #include <typeindex>
@@ -8,7 +9,6 @@
 #include <Common/Exception.h>
 #include <base/demangle.h>
 
-
 namespace DB
 {
     namespace ErrorCodes
@@ -16,6 +16,7 @@ namespace DB
         extern const int LOGICAL_ERROR;
     }
 }
+#endif
 
 
 /** Perform static_cast in release build.
@@ -23,9 +24,9 @@ namespace DB
   * The exact match of the type is checked. That is, cast to the ancestor will be unsuccessful.
   */
 template <typename To, typename From>
-To assert_cast(From && from)
+inline To assert_cast(From && from)
 {
-#ifndef NDEBUG
+#ifdef DEBUG_OR_SANITIZER_BUILD
     try
     {
         if constexpr (std::is_pointer_v<To>)

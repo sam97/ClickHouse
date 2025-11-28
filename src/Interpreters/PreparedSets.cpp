@@ -1,55 +1,297 @@
 #include <chrono>
 #include <variant>
-#include <Interpreters/PreparedSets.h>
-#include <Processors/QueryPlan/QueryPlan.h>
-#include <Interpreters/InterpreterSelectWithUnionQuery.h>
-#include <Interpreters/Set.h>
+#include <Core/Block.h>
+#include <Core/Settings.h>
 #include <IO/Operators.h>
+#include <Interpreters/InterpreterSelectWithUnionQuery.h>
+#include <Interpreters/PreparedSets.h>
+#include <Interpreters/ProcessorsProfileLog.h>
+#include <Interpreters/Set.h>
+#include <Interpreters/Context.h>
+#include <Processors/Executors/CompletedPipelineExecutor.h>
+#include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
+#include <Processors/QueryPlan/CreatingSetsStep.h>
+#include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
+#include <Processors/QueryPlan/QueryPlan.h>
+#include <Processors/Sinks/EmptySink.h>
+#include <Processors/Sinks/NullSink.h>
+#include <QueryPipeline/QueryPipelineBuilder.h>
+#include <QueryPipeline/SizeLimits.h>
+#include <Common/logger_useful.h>
 
 namespace DB
 {
-
-PreparedSetKey PreparedSetKey::forLiteral(const IAST & ast, DataTypes types_)
+namespace Setting
 {
-    /// Remove LowCardinality types from type list because Set doesn't support LowCardinality keys now,
-    ///   just converts LowCardinality to ordinary types.
-    for (auto & type : types_)
-        type = recursiveRemoveLowCardinality(type);
-
-    PreparedSetKey key;
-    key.ast_hash = ast.getTreeHash();
-    key.types = std::move(types_);
-    return key;
+    extern const SettingsUInt64 max_bytes_in_set;
+    extern const SettingsUInt64 max_bytes_to_transfer;
+    extern const SettingsUInt64 max_rows_in_set;
+    extern const SettingsUInt64 max_rows_to_transfer;
+    extern const SettingsOverflowMode set_overflow_mode;
+    extern const SettingsOverflowMode transfer_overflow_mode;
+    extern const SettingsBool transform_null_in;
+    extern const SettingsBool use_index_for_in_with_subqueries;
+    extern const SettingsUInt64 use_index_for_in_with_subqueries_max_values;
 }
 
-PreparedSetKey PreparedSetKey::forSubquery(const IAST & ast)
+namespace ErrorCodes
 {
-    PreparedSetKey key;
-    key.ast_hash = ast.getTreeHash();
-    return key;
+    extern const int LOGICAL_ERROR;
 }
 
-bool PreparedSetKey::operator==(const PreparedSetKey & other) const
+SizeLimits PreparedSets::getSizeLimitsForSet(const Settings & settings)
 {
-    if (ast_hash != other.ast_hash)
+    return SizeLimits(settings[Setting::max_rows_in_set], settings[Setting::max_bytes_in_set], settings[Setting::set_overflow_mode]);
+}
+
+static bool equals(const DataTypes & lhs, const DataTypes & rhs)
+{
+    size_t size = lhs.size();
+    if (size != rhs.size())
         return false;
 
-    if (types.size() != other.types.size())
-        return false;
-
-    for (size_t i = 0; i < types.size(); ++i)
+    for (size_t i = 0; i < size; ++i)
     {
-        if (!types[i]->equals(*other.types[i]))
+        if (!lhs[i]->equals(*rhs[i]))
             return false;
     }
 
     return true;
 }
 
-String PreparedSetKey::toString() const
+
+FutureSetFromStorage::FutureSetFromStorage(Hash hash_, ASTPtr ast_, SetPtr set_, std::optional<StorageID> storage_id_)
+    : hash(hash_), ast(std::move(ast_)), storage_id(std::move(storage_id_)), set(std::move(set_)) {}
+SetPtr FutureSetFromStorage::get() const { return set; }
+FutureSet::Hash FutureSetFromStorage::getHash() const { return hash; }
+DataTypes FutureSetFromStorage::getTypes() const { return set->getElementsTypes(); }
+
+SetPtr FutureSetFromStorage::buildOrderedSetInplace(const ContextPtr &)
+{
+    return set->hasExplicitSetElements() ? set : nullptr;
+}
+
+
+FutureSetFromTuple::FutureSetFromTuple(
+    Hash hash_, ASTPtr ast_, ColumnsWithTypeAndName block,
+    bool transform_null_in, SizeLimits size_limits)
+    : hash(hash_), ast(std::move(ast_))
+{
+    ColumnsWithTypeAndName header = block;
+    for (auto & elem : header)
+        elem.column = elem.column->cloneEmpty();
+
+    set = std::make_shared<Set>(size_limits, 0, transform_null_in);
+
+    set->setHeader(header);
+    Columns columns;
+    columns.reserve(block.size());
+    size_t num_rows = 0;
+    for (const auto & column : block)
+    {
+        columns.emplace_back(column.column);
+        num_rows = column.column->size();
+    }
+
+    set_key_columns.filter = ColumnUInt8::create(num_rows);
+
+    set->insertFromColumns(columns, set_key_columns);
+    set->finishInsert();
+
+    for (const auto & type : set->getElementsTypes())
+    {
+        auto name = type->getName();
+        hash = CityHash_v1_0_2::CityHash128WithSeed(name.data(), name.size(), hash);
+    }
+}
+
+DataTypes FutureSetFromTuple::getTypes() const { return set->getElementsTypes(); }
+FutureSet::Hash FutureSetFromTuple::getHash() const { return hash; }
+
+Columns FutureSetFromTuple::getKeyColumns()
+{
+    if (!set->hasExplicitSetElements())
+    {
+        set->fillSetElements();
+        set->appendSetElements(set_key_columns);
+    }
+
+    return set->getSetElements();
+}
+
+SetPtr FutureSetFromTuple::buildOrderedSetInplace(const ContextPtr & context)
+{
+    if (set->hasExplicitSetElements())
+        return set;
+
+    const auto & settings = context->getSettingsRef();
+    size_t max_values = settings[Setting::use_index_for_in_with_subqueries_max_values];
+    bool too_many_values = max_values && max_values < set->getTotalRowCount();
+    if (!too_many_values)
+    {
+        set->fillSetElements();
+        set->appendSetElements(set_key_columns);
+    }
+
+    return set;
+}
+
+
+FutureSetFromSubquery::FutureSetFromSubquery(
+    Hash hash_,
+    ASTPtr ast_,
+    std::unique_ptr<QueryPlan> source_,
+    StoragePtr external_table_,
+    std::shared_ptr<FutureSetFromSubquery> external_table_set_,
+    bool transform_null_in,
+    SizeLimits size_limits,
+    size_t max_size_for_index)
+    : hash(hash_), ast(std::move(ast_)), external_table(std::move(external_table_)), external_table_set(std::move(external_table_set_)), source(std::move(source_))
+{
+    set_and_key = std::make_shared<SetAndKey>();
+    set_and_key->key = PreparedSets::toString(hash_, {});
+
+    set_and_key->set = std::make_shared<Set>(size_limits, max_size_for_index, transform_null_in);
+    set_and_key->set->setHeader(source->getCurrentHeader()->getColumnsWithTypeAndName());
+}
+
+FutureSetFromSubquery::FutureSetFromSubquery(
+    Hash hash_,
+    ASTPtr ast_,
+    QueryTreeNodePtr query_tree_,
+    bool transform_null_in,
+    SizeLimits size_limits,
+    size_t max_size_for_index)
+    : hash(hash_), ast(std::move(ast_)), query_tree(std::move(query_tree_))
+{
+    set_and_key = std::make_shared<SetAndKey>();
+    set_and_key->key = PreparedSets::toString(hash_, {});
+    set_and_key->set = std::make_shared<Set>(size_limits, max_size_for_index, transform_null_in);
+}
+
+FutureSetFromSubquery::~FutureSetFromSubquery() = default;
+
+SetPtr FutureSetFromSubquery::get() const
+{
+    if (set_and_key->set != nullptr && set_and_key->set->isCreated())
+        return set_and_key->set;
+
+    return nullptr;
+}
+
+void FutureSetFromSubquery::setQueryPlan(std::unique_ptr<QueryPlan> source_)
+{
+    source = std::move(source_);
+    set_and_key->set->setHeader(source->getCurrentHeader()->getColumnsWithTypeAndName());
+}
+
+void FutureSetFromSubquery::setExternalTable(StoragePtr external_table_) { external_table = std::move(external_table_); }
+
+DataTypes FutureSetFromSubquery::getTypes() const
+{
+    return set_and_key->set->getElementsTypes();
+}
+
+FutureSet::Hash FutureSetFromSubquery::getHash() const { return hash; }
+
+std::unique_ptr<QueryPlan> FutureSetFromSubquery::build(const SizeLimits & network_transfer_limits, const PreparedSetsCachePtr & prepared_sets_cache)
+{
+    if (set_and_key->set->isCreated())
+        return nullptr;
+
+    auto plan = std::move(source);
+
+    if (!plan)
+        return nullptr;
+
+    auto creating_set = std::make_unique<CreatingSetStep>(
+        plan->getCurrentHeader(),
+        set_and_key,
+        external_table,
+        network_transfer_limits,
+        prepared_sets_cache);
+    creating_set->setStepDescription("Create set for subquery");
+    plan->addStep(std::move(creating_set));
+    return plan;
+}
+
+void FutureSetFromSubquery::buildSetInplace(const ContextPtr & context)
+{
+    if (external_table_set)
+        external_table_set->buildSetInplace(context);
+
+    const auto & settings = context->getSettingsRef();
+    SizeLimits network_transfer_limits(settings[Setting::max_rows_to_transfer], settings[Setting::max_bytes_to_transfer], settings[Setting::transfer_overflow_mode]);
+    auto prepared_sets_cache = context->getPreparedSetsCache();
+
+    auto plan = build(network_transfer_limits, prepared_sets_cache);
+
+    if (!plan)
+        return;
+
+    auto builder = plan->buildQueryPipeline(QueryPlanOptimizationSettings(context), BuildQueryPipelineSettings(context));
+    auto pipeline = QueryPipelineBuilder::getPipeline(std::move(*builder));
+    pipeline.complete(std::make_shared<EmptySink>(std::make_shared<const Block>(Block())));
+
+    CompletedPipelineExecutor executor(pipeline);
+    executor.execute();
+}
+
+SetPtr FutureSetFromSubquery::buildOrderedSetInplace(const ContextPtr & context)
+{
+    if (!context->getSettingsRef()[Setting::use_index_for_in_with_subqueries])
+        return nullptr;
+
+    if (auto set = get())
+    {
+        if (set->hasExplicitSetElements())
+            return set;
+
+        return nullptr;
+    }
+
+    if (external_table_set)
+    {
+        auto set = external_table_set->buildOrderedSetInplace(context);
+        if (set)
+        {
+            set_and_key->set = set;
+            return set_and_key->set;
+        }
+    }
+
+    const auto & settings = context->getSettingsRef();
+    SizeLimits network_transfer_limits(settings[Setting::max_rows_to_transfer], settings[Setting::max_bytes_to_transfer], settings[Setting::transfer_overflow_mode]);
+    auto prepared_sets_cache = context->getPreparedSetsCache();
+
+    auto plan = build(network_transfer_limits, prepared_sets_cache);
+    if (!plan)
+        return nullptr;
+
+    set_and_key->set->fillSetElements();
+    auto builder = plan->buildQueryPipeline(QueryPlanOptimizationSettings(context), BuildQueryPipelineSettings(context));
+    auto pipeline = QueryPipelineBuilder::getPipeline(std::move(*builder));
+    pipeline.complete(std::make_shared<EmptySink>(std::make_shared<const Block>(Block())));
+
+    CompletedPipelineExecutor executor(pipeline);
+    executor.execute();
+
+    /// SET may not be created successfully at this step because of the sub-query timeout, but if we have
+    /// timeout_overflow_mode set to `break`, no exception is thrown, and the executor just stops executing
+    /// the pipeline without setting `set_and_key->set->is_created` to true.
+    if (!set_and_key->set->isCreated())
+        return nullptr;
+
+    logProcessorProfile(context, pipeline.getProcessors());
+
+    return set_and_key->set;
+}
+
+
+String PreparedSets::toString(const PreparedSets::Hash & key, const DataTypes & types)
 {
     WriteBufferFromOwnString buf;
-    buf << "__set_" << ast_hash.first << "_" << ast_hash.second;
+    buf << "__set_" << DB::toString(key);
     if (!types.empty())
     {
         buf << "(";
@@ -66,113 +308,115 @@ String PreparedSetKey::toString() const
     return buf.str();
 }
 
-SubqueryForSet & PreparedSets::createOrGetSubquery(const String & subquery_id, const PreparedSetKey & key,
-                                                   SizeLimits set_size_limit, bool transform_null_in)
+FutureSetFromTuplePtr PreparedSets::addFromTuple(const Hash & key, ASTPtr ast, ColumnsWithTypeAndName block, const Settings & settings)
 {
-    SubqueryForSet & subquery = subqueries[subquery_id];
+    auto size_limits = getSizeLimitsForSet(settings);
+    auto from_tuple = std::make_shared<FutureSetFromTuple>(
+        key, std::move(ast), std::move(block),
+        settings[Setting::transform_null_in], size_limits);
 
-    /// If you already created a Set with the same subquery / table for another ast
-    /// In that case several PreparedSetKey would share same subquery and set
-    /// Not sure if it's really possible case (maybe for distributed query when set was filled by external table?)
-    if (subquery.set.isValid())
-        sets[key] = subquery.set;
-    else
-    {
-        subquery.set_in_progress = std::make_shared<Set>(set_size_limit, false, transform_null_in);
-        sets[key] = FutureSet(subquery.promise_to_fill_set.get_future());
-    }
+    const auto & set_types = from_tuple->getTypes();
+    auto & sets_by_hash = sets_from_tuple[key];
 
-    if (!subquery.set_in_progress)
-    {
-        subquery.key = key.toString();
-        subquery.set_in_progress = std::make_shared<Set>(set_size_limit, false, transform_null_in);
-    }
+    for (const auto & set : sets_by_hash)
+        if (equals(set->getTypes(), set_types))
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Duplicate set: {}", toString(key, set_types));
 
-    return subquery;
+    sets_by_hash.push_back(from_tuple);
+    return from_tuple;
 }
 
-/// If the subquery is not associated with any set, create default-constructed SubqueryForSet.
-/// It's aimed to fill external table passed to SubqueryForSet::createSource.
-SubqueryForSet & PreparedSets::getSubquery(const String & subquery_id) { return subqueries[subquery_id]; }
-
-void PreparedSets::set(const PreparedSetKey & key, SetPtr set_) { sets[key] = FutureSet(set_); }
-
-FutureSet PreparedSets::getFuture(const PreparedSetKey & key) const
+FutureSetFromStoragePtr PreparedSets::addFromStorage(const Hash & key, ASTPtr ast, SetPtr set_, StorageID storage_id)
 {
-    auto it = sets.find(key);
-    if (it == sets.end())
-        return {};
+    auto from_storage = std::make_shared<FutureSetFromStorage>(key, std::move(ast), std::move(set_), std::move(storage_id));
+    auto [it, inserted] = sets_from_storage.emplace(key, from_storage);
+
+    if (!inserted)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Duplicate set: {}", toString(key, {}));
+
+    return from_storage;
+}
+
+FutureSetFromSubqueryPtr PreparedSets::addFromSubquery(
+    const Hash & key,
+    ASTPtr ast,
+    std::unique_ptr<QueryPlan> source,
+    StoragePtr external_table,
+    FutureSetFromSubqueryPtr external_table_set,
+    const Settings & settings)
+{
+    auto size_limits = getSizeLimitsForSet(settings);
+    auto from_subquery = std::make_shared<FutureSetFromSubquery>(
+        key, std::move(ast), std::move(source), std::move(external_table), std::move(external_table_set),
+        settings[Setting::transform_null_in], size_limits, settings[Setting::use_index_for_in_with_subqueries_max_values]);
+
+    auto [it, inserted] = sets_from_subqueries.emplace(key, from_subquery);
+
+    if (!inserted)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Duplicate set: {}", toString(key, {}));
+
+    return from_subquery;
+}
+
+FutureSetFromSubqueryPtr PreparedSets::addFromSubquery(
+    const Hash & key,
+    ASTPtr ast,
+    QueryTreeNodePtr query_tree,
+    const Settings & settings)
+{
+    auto size_limits = getSizeLimitsForSet(settings);
+    auto from_subquery = std::make_shared<FutureSetFromSubquery>(
+        key, std::move(ast), std::move(query_tree),
+        settings[Setting::transform_null_in], size_limits, settings[Setting::use_index_for_in_with_subqueries_max_values]);
+
+    auto [it, inserted] = sets_from_subqueries.emplace(key, from_subquery);
+
+    if (!inserted)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Duplicate set: {}", toString(key, {}));
+
+    return from_subquery;
+}
+
+FutureSetFromTuplePtr PreparedSets::findTuple(const Hash & key, const DataTypes & types) const
+{
+    auto it = sets_from_tuple.find(key);
+    if (it == sets_from_tuple.end())
+        return nullptr;
+
+    for (const auto & set : it->second)
+        if (equals(set->getTypes(), types))
+            return set;
+
+    return nullptr;
+}
+
+std::shared_ptr<FutureSetFromSubquery> PreparedSets::findSubquery(const Hash & key) const
+{
+    auto it = sets_from_subqueries.find(key);
+    if (it == sets_from_subqueries.end())
+        return nullptr;
+
     return it->second;
 }
 
-SetPtr PreparedSets::get(const PreparedSetKey & key) const
+std::shared_ptr<FutureSetFromStorage> PreparedSets::findStorage(const Hash & key) const
 {
-    auto it = sets.find(key);
-    if (it == sets.end() || !it->second.isReady())
+    auto it = sets_from_storage.find(key);
+    if (it == sets_from_storage.end())
         return nullptr;
-    return it->second.get();
+
+    return it->second;
 }
 
-std::vector<FutureSet> PreparedSets::getByTreeHash(IAST::Hash ast_hash) const
+PreparedSets::Subqueries PreparedSets::getSubqueries() const
 {
-    std::vector<FutureSet> res;
-    for (const auto & it : this->sets)
-    {
-        if (it.first.ast_hash == ast_hash)
-            res.push_back(it.second);
-    }
+    PreparedSets::Subqueries res;
+    res.reserve(sets_from_subqueries.size());
+    for (const auto & [_, set] : sets_from_subqueries)
+        res.push_back(set);
+
     return res;
 }
-
-PreparedSets::SubqueriesForSets PreparedSets::detachSubqueries()
-{
-    auto res = std::move(subqueries);
-    subqueries = SubqueriesForSets();
-    return res;
-}
-
-bool PreparedSets::empty() const { return sets.empty(); }
-
-void SubqueryForSet::createSource(InterpreterSelectWithUnionQuery & interpreter, StoragePtr table_)
-{
-    source = std::make_unique<QueryPlan>();
-    interpreter.buildQueryPlan(*source);
-    if (table_)
-        table = table_;
-}
-
-bool SubqueryForSet::hasSource() const
-{
-    return source != nullptr;
-}
-
-QueryPlanPtr SubqueryForSet::detachSource()
-{
-    auto res = std::move(source);
-    source = nullptr;
-    return res;
-}
-
-
-FutureSet::FutureSet(SetPtr set)
-{
-    std::promise<SetPtr> promise;
-    promise.set_value(set);
-    *this = FutureSet(promise.get_future());
-}
-
-
-bool FutureSet::isReady() const
-{
-    return future_set.valid() &&
-        future_set.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
-}
-
-bool FutureSet::isCreated() const
-{
-    return isReady() && get() != nullptr && get()->isCreated();
-}
-
 
 std::variant<std::promise<SetPtr>, SharedSet> PreparedSetsCache::findOrPromiseToBuild(const String & key)
 {

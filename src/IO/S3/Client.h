@@ -40,11 +40,6 @@ struct ServerSideEncryptionKMSConfig
 #include <aws/core/client/AWSErrorMarshaller.h>
 #include <aws/core/client/RetryStrategy.h>
 
-namespace MockS3
-{
-    struct Client;
-}
-
 namespace DB::S3
 {
 
@@ -54,10 +49,7 @@ struct ClientCache
 {
     ClientCache() = default;
 
-    ClientCache(const ClientCache & other)
-        : region_for_bucket_cache(other.region_for_bucket_cache)
-        , uri_for_bucket_cache(other.uri_for_bucket_cache)
-    {}
+    ClientCache(const ClientCache & other);
 
     ClientCache(ClientCache && other) = delete;
 
@@ -66,11 +58,11 @@ struct ClientCache
 
     void clearCache();
 
-    std::mutex region_cache_mutex;
-    std::unordered_map<std::string, std::string> region_for_bucket_cache;
+    mutable std::mutex region_cache_mutex;
+    std::unordered_map<std::string, std::string> region_for_bucket_cache TSA_GUARDED_BY(region_cache_mutex);
 
-    std::mutex uri_cache_mutex;
-    std::unordered_map<std::string, URI> uri_for_bucket_cache;
+    mutable std::mutex uri_cache_mutex;
+    std::unordered_map<std::string, URI> uri_for_bucket_cache TSA_GUARDED_BY(uri_cache_mutex);
 };
 
 class ClientCacheRegistry
@@ -89,7 +81,27 @@ private:
     ClientCacheRegistry() = default;
 
     std::mutex clients_mutex;
-    std::unordered_map<ClientCache *, std::weak_ptr<ClientCache>> client_caches;
+    std::unordered_map<ClientCache *, std::weak_ptr<ClientCache>> client_caches TSA_GUARDED_BY(clients_mutex);
+};
+
+bool isS3ExpressEndpoint(const std::string & endpoint);
+
+struct ClientSettings
+{
+    bool use_virtual_addressing = false;
+    /// Disable checksum to avoid extra read of the input stream
+    bool disable_checksum = false;
+    /// Should client send ComposeObject request after upload to GCS.
+    ///
+    /// Previously ComposeObject request was required to make Copy possible,
+    /// but not anymore (see [1]).
+    ///
+    ///   [1]: https://cloud.google.com/storage/docs/release-notes#June_23_2023
+    ///
+    /// Ability to enable it preserved since likely it is required for old
+    /// files.
+    bool gcs_issue_compose_request = false;
+    bool is_s3express_bucket = false;
 };
 
 /// Client that improves the client from the AWS SDK
@@ -105,6 +117,8 @@ private:
 class Client : private Aws::S3::S3Client
 {
 public:
+    class RetryStrategy;
+
     /// we use a factory method to verify arguments before creating a client because
     /// there are certain requirements on arguments for it to work correctly
     /// e.g. Client::RetryStrategy should be used
@@ -112,29 +126,20 @@ public:
             size_t max_redirects_,
             ServerSideEncryptionKMSConfig sse_kms_config_,
             const std::shared_ptr<Aws::Auth::AWSCredentialsProvider> & credentials_provider,
-            const Aws::Client::ClientConfiguration & client_configuration,
+            const PocoHTTPClientConfiguration & client_configuration,
             Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy sign_payloads,
-            bool use_virtual_addressing);
+            const ClientSettings & client_settings);
 
-    static std::unique_ptr<Client> create(const Client & other);
+    std::unique_ptr<Client> clone() const;
+
+    std::unique_ptr<Client> cloneWithConfigurationOverride(const PocoHTTPClientConfiguration & client_configuration_override) const;
 
     Client & operator=(const Client &) = delete;
 
     Client(Client && other) = delete;
     Client & operator=(Client &&) = delete;
 
-    ~Client() override
-    {
-        try
-        {
-            ClientCacheRegistry::instance().unregisterClient(cache.get());
-        }
-        catch (...)
-        {
-            tryLogCurrentException(log);
-            throw;
-        }
-    }
+    ~Client() override;
 
     /// Returns the initial endpoint.
     const String & getInitialEndpoint() const { return initial_endpoint; }
@@ -142,16 +147,16 @@ public:
 
     Aws::Auth::AWSCredentials getCredentials() const;
 
-    /// Decorator for RetryStrategy needed for this client to work correctly.
     /// We want to manually handle permanent moves (status code 301) because:
     /// - redirect location is written in XML format inside the response body something that doesn't exist for HEAD
     ///   requests so we need to manually find the correct location
     /// - we want to cache the new location to decrease number of roundtrips for future requests
-    /// This decorator doesn't retry if 301 is detected and fallbacks to the inner retry strategy otherwise.
+    /// Other retries are processed with exponential backoff timeout
+    /// which is limited and rundomly spread
     class RetryStrategy : public Aws::Client::RetryStrategy
     {
     public:
-        explicit RetryStrategy(std::shared_ptr<Aws::Client::RetryStrategy> wrapped_strategy_);
+        explicit RetryStrategy(const PocoHTTPClientConfiguration::RetryStrategy & config_);
 
         /// NOLINTNEXTLINE(google-runtime-int)
         bool ShouldRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors>& error, long attemptedRetries) const override;
@@ -162,14 +167,24 @@ public:
         /// NOLINTNEXTLINE(google-runtime-int)
         long GetMaxAttempts() const override;
 
-        void GetSendToken() override;
+        void RequestBookkeeping(const Aws::Client::HttpResponseOutcome & httpResponseOutcome) override;
+        void RequestBookkeeping(
+            const Aws::Client::HttpResponseOutcome & httpResponseOutcome,
+            const Aws::Client::AWSError<Aws::Client::CoreErrors> & lastError) override;
 
-        bool HasSendToken() override;
+        /// Sometimes [1] GCS may suggest to use Rewrite over CopyObject, i.e.:
+        ///
+        ///     AWSError 'InternalError': Copy spanning locations and/or storage classes could not complete within 30 seconds. Please use the Rewrite method in the JSON API (https://cloud.google.com/storage/docs/json_api/v1/objects/rewrite) instead.
+        ///
+        /// Note, that GCS may return other errors (like EntityTooLarge), but
+        /// those are not retriable by default S3 RetryStrategy.
+        ///
+        ///   [1]: https://github.com/ClickHouse/ClickHouse/issues/59660
+        static bool useGCSRewrite(const Aws::Client::AWSError<Aws::Client::CoreErrors>& error);
 
-        void RequestBookkeeping(const Aws::Client::HttpResponseOutcome& httpResponseOutcome) override;
-        void RequestBookkeeping(const Aws::Client::HttpResponseOutcome& httpResponseOutcome, const Aws::Client::AWSError<Aws::Client::CoreErrors>& lastError) override;
     private:
-        std::shared_ptr<Aws::Client::RetryStrategy> wrapped_strategy;
+        PocoHTTPClientConfiguration::RetryStrategy config;
+        LoggerPtr log;
     };
 
     /// SSE-KMS headers MUST be signed, so they need to be added before the SDK signs the message
@@ -179,24 +194,25 @@ public:
     template <typename RequestType>
     void setKMSHeaders(RequestType & request) const;
 
-    Model::HeadObjectOutcome HeadObject(const HeadObjectRequest & request) const;
-    Model::ListObjectsV2Outcome ListObjectsV2(const ListObjectsV2Request & request) const;
-    Model::ListObjectsOutcome ListObjects(const ListObjectsRequest & request) const;
-    Model::GetObjectOutcome GetObject(const GetObjectRequest & request) const;
+    Model::HeadObjectOutcome HeadObject(HeadObjectRequest & request) const;
+    Model::GetObjectTaggingOutcome GetObjectTagging(GetObjectTaggingRequest & request) const;
+    Model::ListObjectsV2Outcome ListObjectsV2(ListObjectsV2Request & request) const;
+    Model::ListObjectsOutcome ListObjects(ListObjectsRequest & request) const;
+    Model::GetObjectOutcome GetObject(GetObjectRequest & request) const;
 
-    Model::AbortMultipartUploadOutcome AbortMultipartUpload(const AbortMultipartUploadRequest & request) const;
-    Model::CreateMultipartUploadOutcome CreateMultipartUpload(const CreateMultipartUploadRequest & request) const;
-    Model::CompleteMultipartUploadOutcome CompleteMultipartUpload(const CompleteMultipartUploadRequest & request) const;
-    Model::UploadPartOutcome UploadPart(const UploadPartRequest & request) const;
-    Model::UploadPartCopyOutcome UploadPartCopy(const UploadPartCopyRequest & request) const;
+    Model::AbortMultipartUploadOutcome AbortMultipartUpload(AbortMultipartUploadRequest & request) const;
+    Model::CreateMultipartUploadOutcome CreateMultipartUpload(CreateMultipartUploadRequest & request) const;
+    Model::CompleteMultipartUploadOutcome CompleteMultipartUpload(CompleteMultipartUploadRequest & request) const;
+    Model::UploadPartOutcome UploadPart(UploadPartRequest & request) const;
+    Model::UploadPartCopyOutcome UploadPartCopy(UploadPartCopyRequest & request) const;
 
-    Model::CopyObjectOutcome CopyObject(const CopyObjectRequest & request) const;
-    Model::PutObjectOutcome PutObject(const PutObjectRequest & request) const;
-    Model::DeleteObjectOutcome DeleteObject(const DeleteObjectRequest & request) const;
-    Model::DeleteObjectsOutcome DeleteObjects(const DeleteObjectsRequest & request) const;
+    Model::CopyObjectOutcome CopyObject(CopyObjectRequest & request) const;
+    Model::PutObjectOutcome PutObject(PutObjectRequest & request) const;
+    Model::PutObjectTaggingOutcome PutObjectTagging(PutObjectTaggingRequest & request) const;
+    Model::DeleteObjectOutcome DeleteObject(DeleteObjectRequest & request) const;
+    Model::DeleteObjectsOutcome DeleteObjects(DeleteObjectsRequest & request) const;
 
     using ComposeObjectOutcome = Aws::Utils::Outcome<Aws::NoResult, Aws::S3::S3Error>;
-    ComposeObjectOutcome ComposeObject(const ComposeObjectRequest & request) const;
 
     using Aws::S3::S3Client::EnableRequestProcessing;
     using Aws::S3::S3Client::DisableRequestProcessing;
@@ -205,21 +221,42 @@ public:
                           const std::shared_ptr<Aws::Http::HttpRequest>& httpRequest) const override;
 
     bool supportsMultiPartCopy() const;
-private:
-    friend struct ::MockS3::Client;
 
+    bool isS3ExpressBucket() const { return client_settings.is_s3express_bucket; }
+
+    bool isClientForDisk() const
+    {
+        return client_configuration.for_disk_s3;
+    }
+
+    ProviderType getProviderType() const { return provider_type; }
+
+    std::string getGCSOAuthToken() const;
+
+    ThrottlerPtr getPutRequestThrottler() const { return client_configuration.request_throttler.put_throttler; }
+    ThrottlerPtr getGetRequestThrottler() const { return client_configuration.request_throttler.get_throttler; }
+
+    std::string getRegionForBucket(const std::string & bucket, bool force_detect = false) const;
+
+    const PocoHTTPClientConfiguration & getClientConfiguration() const { return client_configuration; }
+
+protected:
+    // visible for testing
     Client(size_t max_redirects_,
            ServerSideEncryptionKMSConfig sse_kms_config_,
            const std::shared_ptr<Aws::Auth::AWSCredentialsProvider> & credentials_provider_,
-           const Aws::Client::ClientConfiguration& client_configuration,
+           const PocoHTTPClientConfiguration & client_configuration,
            Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy sign_payloads,
-           bool use_virtual_addressing);
+           const ClientSettings & client_settings_);
 
-    Client(const Client & other);
+private:
+    Client(
+        const Client & other, const PocoHTTPClientConfiguration & client_configuration);
 
     /// Leave regular functions private so we don't accidentally use them
     /// otherwise region and endpoint redirection won't work
     using Aws::S3::S3Client::HeadObject;
+    using Aws::S3::S3Client::GetObjectTagging;
     using Aws::S3::S3Client::ListObjectsV2;
     using Aws::S3::S3Client::ListObjects;
     using Aws::S3::S3Client::GetObject;
@@ -232,25 +269,44 @@ private:
 
     using Aws::S3::S3Client::CopyObject;
     using Aws::S3::S3Client::PutObject;
+    using Aws::S3::S3Client::PutObjectTagging;
     using Aws::S3::S3Client::DeleteObject;
     using Aws::S3::S3Client::DeleteObjects;
 
+    ComposeObjectOutcome ComposeObject(ComposeObjectRequest & request) const;
+
     template <typename RequestType, typename RequestFn>
-    std::invoke_result_t<RequestFn, RequestType>
-    doRequest(const RequestType & request, RequestFn request_fn) const;
+    std::invoke_result_t<RequestFn, RequestType &>
+    doRequest(RequestType & request, RequestFn request_fn) const;
+
+    template <bool IsReadMethod, typename RequestType, typename RequestFn>
+    std::invoke_result_t<RequestFn, RequestType &>
+    doRequestWithRetryNetworkErrors(RequestType & request, RequestFn request_fn) const;
 
     void updateURIForBucket(const std::string & bucket, S3::URI new_uri) const;
     std::optional<S3::URI> getURIFromError(const Aws::S3::S3Error & error) const;
     std::optional<Aws::S3::S3Error> updateURIForBucketForHead(const std::string & bucket) const;
 
-    std::string getRegionForBucket(const std::string & bucket, bool force_detect = false) const;
     std::optional<S3::URI> getURIForBucket(const std::string & bucket) const;
 
     bool checkIfWrongRegionDefined(const std::string & bucket, const Aws::S3::S3Error & error, std::string & region) const;
     void insertRegionOverride(const std::string & bucket, const std::string & region) const;
 
+    /// Returns true if a specified error means that the credentials used are expired or may have changed.
+    bool checkIfCredentialsChanged(const Aws::S3::S3Error & error) const;
+
+    template <typename RequestResult>
+    RequestResult processRequestResult(RequestResult && outcome) const;
+
+    void updateNextTimeToRetryAfterRetryableError(Aws::Client::AWSError<Aws::Client::CoreErrors> error, Int64 attempt_no) const;
+    void slowDownAfterRetryableError() const;
+
+    void logConfiguration() const;
     String initial_endpoint;
     std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentials_provider;
+    PocoHTTPClientConfiguration client_configuration;
+    Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy sign_payloads;
+    ClientSettings client_settings;
 
     std::string explicit_region;
     mutable bool detect_region = true;
@@ -266,9 +322,12 @@ private:
 
     const size_t max_redirects;
 
+    /// S3 requests must wait until this time because some s3 request fails with a retryable error.
+    mutable std::atomic<UInt64> next_time_to_retry_after_retryable_error = 0;
+
     const ServerSideEncryptionKMSConfig sse_kms_config;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 };
 
 class ClientFactory
@@ -280,7 +339,7 @@ public:
 
     std::unique_ptr<S3::Client> create(
         const PocoHTTPClientConfiguration & cfg,
-        bool is_virtual_hosted_style,
+        ClientSettings client_settings,
         const String & access_key_id,
         const String & secret_access_key,
         const String & server_side_encryption_customer_key_base64,
@@ -293,10 +352,14 @@ public:
         const String & force_region,
         const RemoteHostFilter & remote_host_filter,
         unsigned int s3_max_redirects,
+        const PocoHTTPClientConfiguration::RetryStrategy & retry_strategy,
+        bool s3_slow_all_threads_after_network_error,
+        bool s3_slow_all_threads_after_retryable_error,
         bool enable_s3_requests_logging,
         bool for_disk_s3,
-        const ThrottlerPtr & get_request_throttler,
-        const ThrottlerPtr & put_request_throttler);
+        std::optional<std::string> opt_disk_name,
+        const HTTPRequestThrottler & request_throttler,
+        const String & protocol = "https");
 
 private:
     ClientFactory();

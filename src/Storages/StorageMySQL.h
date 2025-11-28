@@ -5,7 +5,6 @@
 #if USE_MYSQL
 
 #include <Storages/IStorage.h>
-#include <Storages/MySQL/MySQLSettings.h>
 #include <mysqlxx/PoolWithFailover.h>
 
 namespace Poco
@@ -16,11 +15,11 @@ class Logger;
 namespace DB
 {
 
+struct MySQLSettings;
 class NamedCollection;
 
 /** Implements storage in the MySQL database.
   * Use ENGINE = mysql(host_port, database_name, table_name, user_name, password)
-  * Read only.
   */
 class StorageMySQL final : public IStorage, WithContext
 {
@@ -40,6 +39,8 @@ public:
 
     std::string getName() const override { return "MySQL"; }
 
+    bool isExternalDatabase() const override { return true; }
+
     Pipe read(
         const Names & column_names,
         const StorageSnapshotPtr & storage_snapshot,
@@ -49,7 +50,7 @@ public:
         size_t max_block_size,
         size_t num_streams) override;
 
-    SinkToStoragePtr write(const ASTPtr & query, const StorageMetadataPtr & /*metadata_snapshot*/, ContextPtr context) override;
+    SinkToStoragePtr write(const ASTPtr & query, const StorageMetadataPtr & /*metadata_snapshot*/, ContextPtr context, bool async_insert) override;
 
     struct Configuration
     {
@@ -61,6 +62,10 @@ public:
         String password;
         String database;
         String table;
+
+        String ssl_ca;
+        String ssl_cert;
+        String ssl_key;
 
         bool replace_query = false;
         String on_duplicate_clause;
@@ -89,11 +94,11 @@ private:
     bool replace_query;
     std::string on_duplicate_clause;
 
-    MySQLSettings mysql_settings;
+    std::unique_ptr<MySQLSettings> mysql_settings;
 
     mysqlxx::PoolWithFailoverPtr pool;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 };
 
 }

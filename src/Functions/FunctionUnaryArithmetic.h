@@ -339,7 +339,7 @@ public:
         /// Special case when the function is negate, argument is tuple.
         if (auto function_builder = getFunctionForTupleArithmetic(arguments[0].type, context))
         {
-            return function_builder->build(arguments)->execute(arguments, result_type, input_rows_count);
+            return function_builder->build(arguments)->execute(arguments, result_type, input_rows_count, /* dry_run = */ false);
         }
 
         ColumnPtr result_column;
@@ -401,7 +401,7 @@ public:
                             for (size_t i = 0; i < size; ++i)
                             {
                                 vec_res[i] = StringUnaryOperationReduceImpl<Op<UInt8>>::vector(
-                                    chars.data() + offsets[i - 1], chars.data() + offsets[i] - 1);
+                                    chars.data() + offsets[i - 1], chars.data() + offsets[i]);
                             }
                             result_column = std::move(col_res);
                             return true;
@@ -477,31 +477,45 @@ public:
     }
 
 #if USE_EMBEDDED_COMPILER
-    bool isCompilableImpl(const DataTypes & arguments) const override
+    bool isCompilableImpl(const DataTypes & arguments, const DataTypePtr & result_type) const override
     {
         if (1 != arguments.size())
+            return false;
+
+        if (!canBeNativeType(*arguments[0]) || !canBeNativeType(*result_type))
             return false;
 
         return castType(arguments[0].get(), [&](const auto & type)
         {
             using DataType = std::decay_t<decltype(type)>;
             if constexpr (std::is_same_v<DataTypeFixedString, DataType> || std::is_same_v<DataTypeString, DataType>)
+            {
                 return false;
+            }
             else
-                return !IsDataTypeDecimal<DataType> && Op<typename DataType::FieldType>::compilable;
+            {
+                using T0 = typename DataType::FieldType;
+                using T1 = typename Op<T0>::ResultType;
+                if constexpr (!std::is_same_v<T1, InvalidType> && !IsDataTypeDecimal<DataType> && Op<T0>::compilable)
+                    return true;
+            }
+
+            return false;
         });
     }
 
-    llvm::Value * compileImpl(llvm::IRBuilderBase & builder, const DataTypes & types, Values values) const override
+    llvm::Value * compileImpl(llvm::IRBuilderBase & builder, const ValuesWithType & arguments, const DataTypePtr & result_type) const override
     {
-        assert(1 == types.size() && 1 == values.size());
+        assert(1 == arguments.size());
 
         llvm::Value * result = nullptr;
-        castType(types[0].get(), [&](const auto & type)
+        castType(arguments[0].type.get(), [&](const auto & type)
         {
             using DataType = std::decay_t<decltype(type)>;
             if constexpr (std::is_same_v<DataTypeFixedString, DataType> || std::is_same_v<DataTypeString, DataType>)
+            {
                 return false;
+            }
             else
             {
                 using T0 = typename DataType::FieldType;
@@ -509,13 +523,16 @@ public:
                 if constexpr (!std::is_same_v<T1, InvalidType> && !IsDataTypeDecimal<DataType> && Op<T0>::compilable)
                 {
                     auto & b = static_cast<llvm::IRBuilder<> &>(builder);
-                    auto * v = nativeCast(b, types[0], values[0], std::make_shared<DataTypeNumber<T1>>());
+                    auto * v = nativeCast(b, arguments[0], result_type);
                     result = Op<T0>::compile(b, v, is_signed_v<T1>);
+
                     return true;
                 }
             }
+
             return false;
         });
+
         return result;
     }
 #endif
@@ -525,9 +542,9 @@ public:
         return FunctionUnaryArithmeticMonotonicity<Name>::has();
     }
 
-    Monotonicity getMonotonicityForRange(const IDataType &, const Field & left, const Field & right) const override
+    Monotonicity getMonotonicityForRange(const IDataType & type, const Field & left, const Field & right) const override
     {
-        return FunctionUnaryArithmeticMonotonicity<Name>::get(left, right);
+        return FunctionUnaryArithmeticMonotonicity<Name>::get(type, left, right);
     }
 };
 
@@ -535,7 +552,7 @@ public:
 struct PositiveMonotonicity
 {
     static bool has() { return true; }
-    static IFunction::Monotonicity get(const Field &, const Field &)
+    static IFunction::Monotonicity get(const IDataType &, const Field &, const Field &)
     {
         return { .is_monotonic = true };
     }

@@ -1,5 +1,8 @@
-#include "Parser.h"
-#include "KeeperClient.h"
+#include <Parser.h>
+#include <KeeperClient.h>
+
+#include <Parsers/CommonParsers.h>
+#include <Parsers/parseIdentifierOrStringLiteral.h>
 
 
 namespace DB
@@ -7,41 +10,29 @@ namespace DB
 
 bool parseKeeperArg(IParser::Pos & pos, Expected & expected, String & result)
 {
-    expected.add(pos, getTokenName(TokenType::BareWord));
-
-    if (pos->type == TokenType::BareWord)
-    {
-        result = String(pos->begin, pos->end);
-        ++pos;
-        ParserToken{TokenType::Whitespace}.ignore(pos);
-        return true;
-    }
-
-    bool status = parseIdentifierOrStringLiteral(pos, expected, result);
-    ParserToken{TokenType::Whitespace}.ignore(pos);
-    return status;
-}
-
-bool parseKeeperPath(IParser::Pos & pos, Expected & expected, String & path)
-{
-    expected.add(pos, "path");
-
     if (pos->type == TokenType::QuotedIdentifier || pos->type == TokenType::StringLiteral)
-        return parseIdentifierOrStringLiteral(pos, expected, path);
-
-    String result;
-    while (pos->type == TokenType::BareWord || pos->type == TokenType::Slash || pos->type == TokenType::Dot)
+    {
+        if (!parseIdentifierOrStringLiteral(pos, expected, result))
+            return false;
+    }
+    else if (pos->type == TokenType::Number)
     {
         result.append(pos->begin, pos->end);
         ++pos;
     }
+
     ParserToken{TokenType::Whitespace}.ignore(pos);
 
     if (result.empty())
         return false;
 
-    path = result;
     return true;
+}
+
+bool parseKeeperPath(IParser::Pos & pos, Expected & expected, String & path)
+{
+    expected.add(pos, "path");
+    return parseKeeperArg(pos, expected, path);
 }
 
 bool KeeperParser::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
@@ -51,8 +42,8 @@ bool KeeperParser::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     for (const auto & pair : KeeperClient::commands)
         expected.add(pos, pair.first.data());
 
-    for (const auto & flwc : four_letter_word_commands)
-        expected.add(pos, flwc.data());
+    for (const auto & four_letter_word_command : four_letter_word_commands)
+        expected.add(pos, four_letter_word_command.data());
 
     if (pos->type != TokenType::BareWord)
         return false;

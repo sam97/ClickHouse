@@ -4,7 +4,6 @@
 #include <Core/Field.h>
 #include <Common/Stopwatch.h>
 #include <Common/CurrentMetrics.h>
-#include <Common/MemoryTracker.h>
 #include <Common/ThreadStatus.h>
 #include <Storages/MergeTree/MergeType.h>
 #include <Storages/MergeTree/MergeAlgorithm.h>
@@ -13,7 +12,6 @@
 #include <Interpreters/StorageID.h>
 #include <boost/noncopyable.hpp>
 #include <memory>
-#include <list>
 #include <mutex>
 #include <atomic>
 
@@ -22,6 +20,8 @@ namespace CurrentMetrics
 {
     extern const Metric Merge;
 }
+
+class MemoryTracker;
 
 namespace DB
 {
@@ -35,6 +35,7 @@ struct MergeInfo
     Array source_part_names;
     Array source_part_paths;
     std::string partition_id;
+    std::string partition;
     bool is_mutation;
     Float64 elapsed;
     Float64 progress;
@@ -65,8 +66,11 @@ struct Settings;
 
 struct MergeListElement : boost::noncopyable
 {
+    static const MergeTreePartInfo FAKE_RESULT_PART_FOR_PROJECTION;
+
     const StorageID table_id;
     std::string partition_id;
+    std::string partition;
 
     const std::string result_part_name;
     const std::string result_part_path;
@@ -102,6 +106,7 @@ struct MergeListElement : boost::noncopyable
     std::atomic<MergeAlgorithm> merge_algorithm;
 
     ThreadGroupPtr thread_group;
+    CurrentMetrics::Increment num_parts_metric_increment;
 
     MergeListElement(
         const StorageID & table_id_,
@@ -110,7 +115,7 @@ struct MergeListElement : boost::noncopyable
 
     MergeInfo getInfo() const;
 
-    const MemoryTracker & getMemoryTracker() const { return thread_group->memory_tracker; }
+    const MemoryTracker & getMemoryTracker() const;
 
     MergeListElement * ptr() { return this; }
 

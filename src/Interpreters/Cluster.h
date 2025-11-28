@@ -4,6 +4,7 @@
 #include <Client/ConnectionPoolWithFailover.h>
 #include <Common/Macros.h>
 #include <Common/MultiVersion.h>
+#include <Common/Priority.h>
 
 #include <Poco/Net/SocketAddress.h>
 
@@ -44,7 +45,8 @@ struct ClusterConnectionParameters
     bool treat_local_as_remote;
     bool treat_local_port_as_remote;
     bool secure = false;
-    Int64 priority = 1;
+    const String & bind_host;
+    Priority priority{1};
     String cluster_name;
     String cluster_secret;
 };
@@ -94,7 +96,7 @@ public:
         * <node>
         *     <host>example01-01-1</host>
         *     <port>9000</port>
-        *     <!-- <user>, <password>, <default_database>, <compression>, <priority>. <secure> if needed -->
+        *     <!-- <user>, <password>, <default_database>, <compression>, <priority>. <secure>, <bind_host> if needed -->
         * </node>
         * ...
         * or in <shard> and inside in <replica> elements:
@@ -102,7 +104,7 @@ public:
         *     <replica>
         *         <host>example01-01-1</host>
         *         <port>9000</port>
-        *         <!-- <user>, <password>, <default_database>, <compression>, <priority>. <secure> if needed -->
+        *         <!-- <user>, <password>, <default_database>, <compression>, <priority>. <secure>, <bind_host> if needed -->
         *    </replica>
         * </shard>
         */
@@ -113,6 +115,8 @@ public:
         UInt16 port{0};
         String user;
         String password;
+        String proto_send_chunked = "notchunked";
+        String proto_recv_chunked = "notchunked";
         String quota_key;
 
         /// For inter-server authorization
@@ -131,7 +135,9 @@ public:
         Protocol::Compression compression = Protocol::Compression::Enable;
         Protocol::Secure secure = Protocol::Secure::Disable;
 
-        Int64 priority = 1;
+        String bind_host;
+
+        Priority priority{1};
 
         Address() = default;
 
@@ -142,12 +148,6 @@ public:
             const String & cluster_secret_,
             UInt32 shard_index_ = 0,
             UInt32 replica_index_ = 0);
-
-        Address(
-            const String & host_port_,
-            const ClusterConnectionParameters & params,
-            UInt32 shard_index_,
-            UInt32 replica_index_);
 
         Address(
             const DatabaseReplicaInfo & info,
@@ -171,12 +171,12 @@ public:
         String toFullString(bool use_compact_format) const;
 
         /// Returns address with only shard index and replica index or full address without shard index and replica index
-        static Address fromFullString(const String & address_full_string);
+        static Address fromFullString(std::string_view full_string);
 
         /// Returns resolved address if it does resolve.
         std::optional<Poco::Net::SocketAddress> getResolvedAddress() const;
 
-        auto tuple() const { return std::tie(host_name, port, secure, user, password, default_database); }
+        auto tuple() const { return std::tie(host_name, port, secure, user, password, default_database, bind_host); }
         bool operator==(const Address & other) const { return tuple() == other.tuple(); }
 
     private:
@@ -220,14 +220,15 @@ public:
         ShardInfoInsertPathForInternalReplication insert_path_for_internal_replication;
         /// Number of the shard, the indexation begins with 1
         UInt32 shard_num = 0;
+        String name;
         UInt32 weight = 1;
         Addresses local_addresses;
-        Addresses all_addresses;
         /// nullptr if there are no remote addresses
         ConnectionPoolWithFailoverPtr pool;
         /// Connection pool for each replica, contains nullptr for local replicas
         ConnectionPoolPtrs per_replica_pools;
         bool has_internal_replication = false;
+        String default_database;
     };
 
     using ShardsInfo = std::vector<ShardInfo>;
@@ -278,6 +279,8 @@ public:
     /// Are distributed DDL Queries (ON CLUSTER Clause) allowed for this cluster
     bool areDistributedDDLQueriesAllowed() const { return allow_distributed_ddl_queries; }
 
+    const String & getName() const { return name; }
+
 private:
     SlotToShard slot_to_shard;
 
@@ -295,8 +298,15 @@ private:
     struct ReplicasAsShardsTag {};
     Cluster(ReplicasAsShardsTag, const Cluster & from, const Settings & settings, size_t max_replicas_from_shard);
 
-    void addShard(const Settings & settings, Addresses && addresses, bool treat_local_as_remote, UInt32 current_shard_num,
-                  ShardInfoInsertPathForInternalReplication && insert_paths = {}, UInt32 weight = 1, bool internal_replication = false);
+    void addShard(
+        const Settings & settings,
+        Addresses addresses,
+        bool treat_local_as_remote,
+        UInt32 current_shard_num,
+        String current_shard_name = "",
+        UInt32 weight = 1,
+        ShardInfoInsertPathForInternalReplication insert_paths = {},
+        bool internal_replication = false);
 
     /// Inter-server secret
     String secret;

@@ -1,7 +1,8 @@
-#include <Processors/Transforms/PartialSortingTransform.h>
-#include <Interpreters/sortBlock.h>
 #include <Core/SortCursor.h>
+#include <Interpreters/sortBlock.h>
+#include <Processors/Transforms/PartialSortingTransform.h>
 #include <Common/PODArray.h>
+#include <Common/iota.h>
 
 namespace DB
 {
@@ -36,9 +37,7 @@ size_t getFilterMask(const ColumnRawPtrs & raw_block_columns, const Columns & th
     else
     {
         rows_to_compare.resize(num_rows);
-
-        for (size_t i = 0; i < num_rows; ++i)
-            rows_to_compare[i] = i;
+        iota(rows_to_compare.data(), num_rows, UInt64(0));
 
         size_t size = description.size();
         for (size_t i = 0; i < size; ++i)
@@ -75,7 +74,7 @@ bool compareWithThreshold(const ColumnRawPtrs & raw_block_columns, size_t min_bl
 
         if (res < 0)
             return true;
-        else if (res > 0)
+        if (res > 0)
             return false;
     }
 
@@ -85,7 +84,7 @@ bool compareWithThreshold(const ColumnRawPtrs & raw_block_columns, size_t min_bl
 }
 
 PartialSortingTransform::PartialSortingTransform(
-    const Block & header_, const SortDescription & description_, UInt64 limit_)
+    SharedHeader header_, const SortDescription & description_, UInt64 limit_)
     : ISimpleTransform(header_, header_, false)
     , description(description_)
     , limit(limit_)
@@ -94,7 +93,7 @@ PartialSortingTransform::PartialSortingTransform(
     assert(!description_.empty());
 
     for (const auto & column_sort_desc : description)
-        description_with_positions.emplace_back(column_sort_desc, header_.getPositionByName(column_sort_desc.column_name));
+        description_with_positions.emplace_back(column_sort_desc, header_->getPositionByName(column_sort_desc.column_name));
 }
 
 void PartialSortingTransform::transform(Chunk & chunk)
@@ -159,7 +158,7 @@ void PartialSortingTransform::transform(Chunk & chunk)
             {
                 MutableColumnPtr sort_description_threshold_column_updated = raw_block_columns[i]->cloneEmpty();
                 sort_description_threshold_column_updated->insertFrom(*raw_block_columns[i], min_row_to_compare);
-                sort_description_threshold_columns_updated[i] = std::move(sort_description_threshold_column_updated);
+                sort_description_threshold_columns_updated[i] = sort_description_threshold_column_updated->convertToFullColumnIfSparse();
             }
 
             sort_description_threshold_columns = std::move(sort_description_threshold_columns_updated);

@@ -13,9 +13,7 @@
 #include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
 #include <IO/WriteBufferFromArena.h>
-#include <IO/WriteHelpers.h>
 #include <Access/Common/AccessFlags.h>
-#include <Interpreters/Context.h>
 
 #include <mutex>
 #include <filesystem>
@@ -90,10 +88,9 @@ protected:
 
     ResultT impl(uintptr_t addr) const
     {
-        auto symbol_index_ptr = SymbolIndex::instance();
-        const SymbolIndex & symbol_index = *symbol_index_ptr;
+        const SymbolIndex & symbol_index = SymbolIndex::instance();
 
-        if (const auto * object = symbol_index.findObject(reinterpret_cast<const void *>(addr)))
+        if (const auto * object = symbol_index.thisObject())
         {
             auto dwarf_it = cache.dwarfs.try_emplace(object->name, object->elf).first;
             if (!std::filesystem::exists(object->name))
@@ -102,16 +99,14 @@ protected:
             Dwarf::LocationInfo location;
             std::vector<Dwarf::SymbolizedFrame> frames; // NOTE: not used in FAST mode.
             ResultT result;
-            if (dwarf_it->second.findAddress(addr - uintptr_t(object->address_begin), location, locationInfoMode, frames))
+            if (dwarf_it->second.findAddress(addr, location, locationInfoMode, frames))
             {
                 setResult(result, location, frames);
                 return result;
             }
-            else
-                return {object->name};
+            return {object->name};
         }
-        else
-            return {};
+        return {};
     }
 
     ResultT implCached(uintptr_t addr) const

@@ -37,7 +37,7 @@ void registerInputFormatJSONCompactColumns(FormatFactory & factory)
            const RowInputFormatParams &,
            const FormatSettings & settings)
         {
-            return std::make_shared<JSONColumnsBlockInputFormatBase>(buf, sample, settings, std::make_unique<JSONCompactColumnsReader>(buf));
+            return std::make_shared<JSONColumnsBlockInputFormatBase>(buf, std::make_shared<const Block>(sample), settings, std::make_unique<JSONCompactColumnsReader>(buf));
         }
     );
 }
@@ -53,7 +53,7 @@ void registerJSONCompactColumnsSchemaReader(FormatFactory & factory)
     );
     factory.registerAdditionalInfoForSchemaCacheGetter("JSONCompactColumns", [](const FormatSettings & settings)
     {
-        auto result = getAdditionalFormatInfoByEscapingRule(settings, FormatSettings::EscapingRule::JSON);
+        auto result = getAdditionalFormatInfoForAllRowBasedFormats(settings) + getAdditionalFormatInfoByEscapingRule(settings, FormatSettings::EscapingRule::JSON);
         return result + fmt::format(", column_names_for_schema_inference={}", settings.column_names_for_schema_inference);
     });
 }

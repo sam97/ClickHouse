@@ -1,4 +1,5 @@
 import pytest
+
 from helpers.client import QueryRuntimeException
 from helpers.cluster import ClickHouseCluster
 
@@ -46,7 +47,7 @@ def test_move_partition_to_disk_on_cluster(start_cluster):
             "(x UInt64) "
             "ENGINE=ReplicatedMergeTree('/clickhouse/tables/test_local_table', '{replica}') "
             "ORDER BY tuple()"
-            "SETTINGS storage_policy = 'jbod_with_external';",
+            "SETTINGS storage_policy = 'jbod_with_external', temporary_directories_lifetime=1;",
         )
 
     node1.query("INSERT INTO test_local_table VALUES (0)")

@@ -13,13 +13,16 @@ public:
     template <typename S>
     explicit ReadBufferFromString(const S & s) : ReadBufferFromMemory(s.data(), s.size()) {}
 
-    explicit ReadBufferFromString(std::string_view s) : ReadBufferFromMemory(s.data(), s.size()) {}
+    explicit ReadBufferFromString(std::string_view s) : ReadBufferFromMemory(s) {}
 };
 
 class ReadBufferFromOwnString : public String, public ReadBufferFromString
 {
 public:
-    explicit ReadBufferFromOwnString(const String & s_): String(s_), ReadBufferFromString(*this) {}
+    template <typename S>
+    explicit ReadBufferFromOwnString(S && s_) : String(std::forward<S>(s_)), ReadBufferFromString(*this)
+    {
+    }
 };
 
 }

@@ -4,10 +4,13 @@
 #include <DataTypes/IDataType.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeFixedString.h>
+#include <DataTypes/DataTypeQBit.h>
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
+#include <Columns/ColumnQBit.h>
 #include <Common/assert_cast.h>
 #include <memory>
 
@@ -17,11 +20,8 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
-    extern const int ILLEGAL_INDEX;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
     extern const int NOT_FOUND_COLUMN_IN_BLOCK;
-    extern const int NUMBER_OF_DIMENSIONS_MISMATCHED;
-    extern const int SIZES_OF_ARRAYS_DONT_MATCH;
 }
 
 namespace
@@ -29,37 +29,20 @@ namespace
 
 /** Extract element of tuple by constant index or name. The operation is essentially free.
   * Also the function looks through Arrays: you can get Array of tuple elements from Array of Tuples.
+  * The logic of qbitElement is integrated into this function because AST makes any dot syntax (vec.i) a tupleElement(vec, i) call.
   */
 class FunctionTupleElement : public IFunction
 {
 public:
     static constexpr auto name = "tupleElement";
-    static FunctionPtr create(ContextPtr)
-    {
-        return std::make_shared<FunctionTupleElement>();
-    }
 
-    String getName() const override
-    {
-        return name;
-    }
-
+    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionTupleElement>(); }
+    String getName() const override { return name; }
     bool isVariadic() const override { return true; }
-
-    size_t getNumberOfArguments() const override
-    {
-        return 0;
-    }
-
-    bool useDefaultImplementationForConstants() const override
-    {
-        return true;
-    }
-
+    size_t getNumberOfArguments() const override { return 0; }
+    bool useDefaultImplementationForConstants() const override { return true; }
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {1}; }
-
     bool useDefaultImplementationForNulls() const override { return false; }
-
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
@@ -72,198 +55,172 @@ public:
                             getName(), number_of_arguments);
 
         size_t count_arrays = 0;
-        const IDataType * tuple_col = arguments[0].type.get();
-        while (const DataTypeArray * array = checkAndGetDataType<DataTypeArray>(tuple_col))
+        const IDataType * input_type = arguments[0].type.get();
+        while (const DataTypeArray * array = checkAndGetDataType<DataTypeArray>(input_type))
         {
-            tuple_col = array->getNestedType().get();
+            input_type = array->getNestedType().get();
             ++count_arrays;
         }
 
-        const DataTypeTuple * tuple = checkAndGetDataType<DataTypeTuple>(tuple_col);
-        if (!tuple)
-            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-                "First argument for function {} must be tuple or array of tuple. Actual {}",
-                getName(),
-                arguments[0].type->getName());
-
-        auto index = getElementNum(arguments[1].column, *tuple, number_of_arguments);
-        if (index.has_value())
+        if (const DataTypeTuple * tuple = checkAndGetDataType<DataTypeTuple>(input_type))
         {
-            DataTypePtr out_return_type = tuple->getElements()[index.value()];
-
-            for (; count_arrays; --count_arrays)
-                out_return_type = std::make_shared<DataTypeArray>(out_return_type);
-
-            return out_return_type;
-        }
-        else
-        {
-            const IDataType * default_col = arguments[2].type.get();
-            size_t default_argument_count_arrays = 0;
-            if (const DataTypeArray * array = checkAndGetDataType<DataTypeArray>(default_col))
+            std::optional<size_t> index = getTupleElementIndex(arguments[1].column, *tuple, number_of_arguments);
+            if (index.has_value())
             {
-                default_argument_count_arrays = array->getNumberOfDimensions();
-            }
+                DataTypePtr return_type = tuple->getElements()[index.value()];
 
-            if (count_arrays != default_argument_count_arrays)
-            {
-                throw Exception(ErrorCodes::NUMBER_OF_DIMENSIONS_MISMATCHED,
-                                "Dimension of types mismatched between first argument and third argument. "
-                                "Dimension of 1st argument: {}. "
-                                "Dimension of 3rd argument: {}.",count_arrays, default_argument_count_arrays);
+                for (; count_arrays; --count_arrays)
+                    return_type = std::make_shared<DataTypeArray>(return_type);
+
+                return return_type;
             }
             return arguments[2].type;
         }
+        else if (const DataTypeQBit * qbit = checkAndGetDataType<DataTypeQBit>(input_type))
+        {
+            std::optional<size_t> index = getQBitElementIndex(arguments[1].column, *qbit, number_of_arguments);
+            if (index.has_value())
+            {
+                DataTypePtr return_type = qbit->getNestedTupleElementType();
+
+                for (; count_arrays; --count_arrays)
+                    return_type = std::make_shared<DataTypeArray>(return_type);
+
+                return return_type;
+            }
+            return arguments[2].type;
+        }
+
+        throw Exception(
+            ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+            "First argument for function {} must be Tuple, array of Tuple, QBit or array of QBit. Actual {}",
+            getName(),
+            arguments[0].type->getName());
     }
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
     {
-        Columns array_offsets;
+        const auto & input_arg = arguments[0];
+        const IDataType * input_type = input_arg.type.get();
+        const IColumn * input_col = input_arg.column.get();
 
-        const auto & first_arg = arguments[0];
-
-        const IDataType * tuple_type = first_arg.type.get();
-        const IColumn * tuple_col = first_arg.column.get();
-        bool first_arg_is_const = false;
-        if (typeid_cast<const ColumnConst *>(tuple_col))
+        bool input_arg_is_const = false;
+        if (typeid_cast<const ColumnConst *>(input_col))
         {
-            tuple_col = assert_cast<const ColumnConst *>(tuple_col)->getDataColumnPtr().get();
-            first_arg_is_const = true;
+            input_col = assert_cast<const ColumnConst *>(input_col)->getDataColumnPtr().get();
+            input_arg_is_const = true;
         }
-        while (const DataTypeArray * array_type = checkAndGetDataType<DataTypeArray>(tuple_type))
-        {
-            const ColumnArray * array_col = assert_cast<const ColumnArray *>(tuple_col);
 
-            tuple_type = array_type->getNestedType().get();
-            tuple_col = &array_col->getData();
+        Columns array_offsets;
+        while (const DataTypeArray * array_type = checkAndGetDataType<DataTypeArray>(input_type))
+        {
+            const ColumnArray * array_col = assert_cast<const ColumnArray *>(input_col);
+
+            input_type = array_type->getNestedType().get();
+            input_col = &array_col->getData();
             array_offsets.push_back(array_col->getOffsetsPtr());
         }
 
-        const DataTypeTuple * tuple_type_concrete = checkAndGetDataType<DataTypeTuple>(tuple_type);
-        const ColumnTuple * tuple_col_concrete = checkAndGetColumn<ColumnTuple>(tuple_col);
-        if (!tuple_type_concrete || !tuple_col_concrete)
-            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-                "First argument for function {} must be tuple or array of tuple. Actual {}",
-                getName(),
-                first_arg.type->getName());
 
-        auto index = getElementNum(arguments[1].column, *tuple_type_concrete, arguments.size());
+        const DataTypeTuple * input_type_as_tuple = checkAndGetDataType<DataTypeTuple>(input_type);
+        const ColumnTuple * input_col_as_tuple = checkAndGetColumn<ColumnTuple>(input_col);
 
-        if (!index.has_value())
+        if (input_type_as_tuple && input_col_as_tuple)
         {
-            if (!array_offsets.empty())
-            {
-                recursiveCheckArrayOffsets(arguments[0].column, arguments[2].column, array_offsets.size());
-            }
-            return arguments[2].column;
+            std::optional<size_t> index = getTupleElementIndex(arguments[1].column, *input_type_as_tuple, arguments.size());
+
+            if (!index.has_value())
+                return arguments[2].column;
+
+            ColumnPtr res = input_col_as_tuple->getColumnPtr(index.value());
+
+            /// Wrap into Arrays
+            for (auto it = array_offsets.rbegin(); it != array_offsets.rend(); ++it)
+                res = ColumnArray::create(res, *it);
+
+            if (input_arg_is_const)
+                res = ColumnConst::create(res, input_rows_count);
+
+            return res;
         }
 
-        ColumnPtr res = tuple_col_concrete->getColumns()[index.value()];
 
-        /// Wrap into Arrays
-        for (auto it = array_offsets.rbegin(); it != array_offsets.rend(); ++it)
-            res = ColumnArray::create(res, *it);
+        const DataTypeQBit * input_type_as_qbit = checkAndGetDataType<DataTypeQBit>(input_type);
+        const ColumnQBit * input_col_as_qbit = checkAndGetColumn<ColumnQBit>(input_col);
 
-        if (first_arg_is_const)
+        if (input_type_as_qbit && input_col_as_qbit)
         {
-            res = ColumnConst::create(res, input_rows_count);
+            std::optional<size_t> index = getQBitElementIndex(arguments[1].column, *input_type_as_qbit, arguments.size());
+
+            if (!index.has_value())
+                return arguments[2].column;
+
+            ColumnPtr res = assert_cast<const ColumnTuple &>(input_col_as_qbit->getTupleColumn()).getColumnPtr(index.value());
+
+            /// Wrap into Arrays
+            for (auto it = array_offsets.rbegin(); it != array_offsets.rend(); ++it)
+                res = ColumnArray::create(res, *it);
+
+            if (input_arg_is_const)
+                res = ColumnConst::create(res, input_rows_count);
+
+            return res;
         }
-        return res;
+
+
+        throw Exception(
+            ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+            "First argument for function {} must be Tuple, array of Tuple, QBit or array of QBit. Actual {}",
+            getName(),
+            input_arg.type->getName());
     }
 
 private:
-
-    void recursiveCheckArrayOffsets(ColumnPtr col_x, ColumnPtr col_y, size_t depth) const
+    std::optional<size_t> getTupleElementIndex(const ColumnPtr & index_column, const DataTypeTuple & tuple, size_t argument_size) const
     {
-        for (size_t i = 1; i < depth; ++i)
+        if (checkAndGetColumnConst<ColumnUInt8>(index_column.get()) || checkAndGetColumnConst<ColumnUInt16>(index_column.get())
+            || checkAndGetColumnConst<ColumnUInt32>(index_column.get()) || checkAndGetColumnConst<ColumnUInt64>(index_column.get()))
         {
-            checkArrayOffsets(col_x, col_y);
-            col_x = assert_cast<const ColumnArray *>(col_x.get())->getDataPtr();
-            col_y = assert_cast<const ColumnArray *>(col_y.get())->getDataPtr();
-        }
-        checkArrayOffsets(col_x, col_y);
-    }
+            const size_t index = index_column->getUInt(0);
 
-    void checkArrayOffsets(ColumnPtr col_x, ColumnPtr col_y) const
-    {
-        if (isColumnConst(*col_x))
-        {
-            checkArrayOffsetsWithFirstArgConst(col_x, col_y);
-        }
-        else if (isColumnConst(*col_y))
-        {
-            checkArrayOffsetsWithFirstArgConst(col_y, col_x);
-        }
-        else
-        {
-            const auto & array_x = *assert_cast<const ColumnArray *>(col_x.get());
-            const auto & array_y = *assert_cast<const ColumnArray *>(col_y.get());
-            if (!array_x.hasEqualOffsets(array_y))
-            {
-                throw Exception(ErrorCodes::SIZES_OF_ARRAYS_DONT_MATCH,
-                                "The argument 1 and argument 3 of function {} have different array sizes", getName());
-            }
-        }
-    }
-
-    void checkArrayOffsetsWithFirstArgConst(ColumnPtr col_x, ColumnPtr col_y) const
-    {
-        col_x = assert_cast<const ColumnConst *>(col_x.get())->getDataColumnPtr();
-        col_y = col_y->convertToFullColumnIfConst();
-        const auto & array_x = *assert_cast<const ColumnArray *>(col_x.get());
-        const auto & array_y = *assert_cast<const ColumnArray *>(col_y.get());
-
-        const auto & offsets_x = array_x.getOffsets();
-        const auto & offsets_y = array_y.getOffsets();
-
-        ColumnArray::Offset prev_offset = 0;
-        size_t row_size = offsets_y.size();
-        for (size_t row = 0; row < row_size; ++row)
-        {
-            if (unlikely(offsets_x[0] != offsets_y[row] - prev_offset))
-            {
-                throw Exception(ErrorCodes::SIZES_OF_ARRAYS_DONT_MATCH,
-                                "The argument 1 and argument 3 of function {} have different array sizes", getName());
-            }
-            prev_offset = offsets_y[row];
-        }
-    }
-
-    std::optional<size_t> getElementNum(const ColumnPtr & index_column, const DataTypeTuple & tuple, const size_t argument_size) const
-    {
-        if (checkAndGetColumnConst<ColumnUInt8>(index_column.get())
-            || checkAndGetColumnConst<ColumnUInt16>(index_column.get())
-            || checkAndGetColumnConst<ColumnUInt32>(index_column.get())
-            || checkAndGetColumnConst<ColumnUInt64>(index_column.get()))
-        {
-            size_t index = index_column->getUInt(0);
-
-            if (index == 0)
-                throw Exception(ErrorCodes::ILLEGAL_INDEX, "Indices in tuples are 1-based.");
-
-            if (index > tuple.getElements().size())
-                throw Exception(ErrorCodes::ILLEGAL_INDEX, "Index for tuple element is out of range.");
-
-            return std::optional<size_t>(index - 1);
-        }
-        else if (const auto * name_col = checkAndGetColumnConst<ColumnString>(index_column.get()))
-        {
-            auto index = tuple.tryGetPositionByName(name_col->getValue<String>());
-            if (index.has_value())
-            {
-                return index;
-            }
+            if (index > 0 && index <= tuple.getElements().size())
+                return {index - 1};
 
             if (argument_size == 2)
-            {
-                throw Exception(ErrorCodes::NOT_FOUND_COLUMN_IN_BLOCK, "Tuple doesn't have element with name '{}'", name_col->getValue<String>());
-            }
+                throw Exception(ErrorCodes::NOT_FOUND_COLUMN_IN_BLOCK, "Tuple doesn't have element with index '{}'", index);
             return std::nullopt;
         }
-        else
-            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-                "Second argument to {} must be a constant UInt or String",
-                getName());
+        if (const auto * name_col = checkAndGetColumnConst<ColumnString>(index_column.get()))
+        {
+            std::optional<size_t> index = tuple.tryGetPositionByName(name_col->getValue<String>());
+
+            if (index.has_value())
+                return index;
+
+            if (argument_size == 2)
+                throw Exception(
+                    ErrorCodes::NOT_FOUND_COLUMN_IN_BLOCK, "Tuple doesn't have element with name '{}'", name_col->getValue<String>());
+            return std::nullopt;
+        }
+        throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Second argument to {} must be a constant UInt or String", getName());
+    }
+
+    std::optional<size_t> getQBitElementIndex(const ColumnPtr & index_column, const DataTypeQBit & qbit, size_t argument_size) const
+    {
+        if (checkAndGetColumnConst<ColumnUInt8>(index_column.get()) || checkAndGetColumnConst<ColumnUInt16>(index_column.get())
+            || checkAndGetColumnConst<ColumnUInt32>(index_column.get()) || checkAndGetColumnConst<ColumnUInt64>(index_column.get()))
+        {
+            const size_t index = index_column->getUInt(0);
+
+            if (index > 0 && index <= qbit.getElementSize())
+                return {index - 1};
+
+            if (argument_size == 2)
+                throw Exception(ErrorCodes::NOT_FOUND_COLUMN_IN_BLOCK, "QBit doesn't have an element with index '{}'", index);
+
+            return std::nullopt;
+        }
+        throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Second argument to {} must be a constant UInt", getName());
     }
 };
 
@@ -271,7 +228,56 @@ private:
 
 REGISTER_FUNCTION(TupleElement)
 {
-    factory.registerFunction<FunctionTupleElement>();
+    FunctionDocumentation::Description description = R"(
+Extracts an element from a tuple by index or name.
+
+For access by index, an 1-based numeric index is expected.
+For access by name, the element name can be provided as a string (works only for named tuples).
+
+An optional third argument specifies a default value which is returned instead of throwing an exception when the accessed element does not exist.
+All arguments must be constants.
+
+This function has zero runtime cost and implements the operators `x.index` and `x.name`.
+)";
+    FunctionDocumentation::Syntax syntax = "tupleElement(tuple, index|name[, default_value])";
+    FunctionDocumentation::Arguments arguments = {
+        {"tuple", "A tuple or array of tuples.", {"Tuple(T)", "Array(Tuple(T))"}},
+        {"index", "Column index, starting from 1.", {"const UInt8/16/32/64"}},
+        {"name", "Name of the element.", {"const String"}},
+        {"default_value", "Default value returned when index is out of bounds or element doesn't exist.", {"Any"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns the element at the specified index or name.", {"Any"}};
+    FunctionDocumentation::Examples examples = {
+    {
+         "Index access",
+         "SELECT tupleElement((1, 'hello'), 2)",
+         "hello"
+    },
+    {
+        "Named tuple with table",
+         R"(
+CREATE TABLE example (values Tuple(name String, age UInt32)) ENGINE = Memory;
+INSERT INTO example VALUES (('Alice', 30));
+SELECT tupleElement(values, 'name') FROM example;
+         )",
+         "Alice"
+    },
+    {
+        "With default value",
+        "SELECT tupleElement((1, 2), 5, 'not_found')",
+        "not_found"
+    },
+    {
+        "Operator syntax",
+        "SELECT (1, 'hello').2",
+        "hello"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Tuple;
+    FunctionDocumentation documentation = {description, syntax, arguments, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionTupleElement>(documentation);
 }
 
 }

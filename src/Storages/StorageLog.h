@@ -40,7 +40,7 @@ public:
         const ColumnsDescription & columns_,
         const ConstraintsDescription & constraints_,
         const String & comment,
-        bool attach,
+        LoadingStrictnessLevel mode,
         ContextMutablePtr context_);
 
     ~StorageLog() override;
@@ -55,11 +55,12 @@ public:
         size_t max_block_size,
         size_t num_streams) override;
 
-    SinkToStoragePtr write(const ASTPtr & query, const StorageMetadataPtr & metadata_snapshot, ContextPtr local_context) override;
+    SinkToStoragePtr write(const ASTPtr & query, const StorageMetadataPtr & metadata_snapshot, ContextPtr local_context, bool async_insert) override;
 
     void rename(const String & new_path_to_table_data, const StorageID & new_table_id) override;
 
-    CheckResults checkData(const ASTPtr & query, ContextPtr local_context) override;
+    DataValidationTasksPtr getCheckTaskList(const CheckTaskFilter & check_task_filter, ContextPtr context) override;
+    std::optional<CheckResult> checkDataNext(DataValidationTasksPtr & check_task_list) override;
 
     void truncate(const ASTPtr &, const StorageMetadataPtr &, ContextPtr, TableExclusiveLockHolder &) override;
 
@@ -68,8 +69,8 @@ public:
     bool supportsSubcolumns() const override { return true; }
     ColumnSizeByName getColumnSizes() const override;
 
-    std::optional<UInt64> totalRows(const Settings & settings) const override;
-    std::optional<UInt64> totalBytes(const Settings & settings) const override;
+    std::optional<UInt64> totalRows(ContextPtr) const override;
+    std::optional<UInt64> totalBytes(ContextPtr) const override;
 
     void backupData(BackupEntriesCollector & backup_entries_collector, const String & data_path_in_backup, const std::optional<ASTs> & partitions) override;
     void restoreDataFromBackup(RestorerFromBackup & restorer, const String & data_path_in_backup, const std::optional<ASTs> & partitions) override;
@@ -132,6 +133,9 @@ private:
     size_t num_data_files = 0;
     std::map<String, DataFile *> data_files_by_names;
 
+    /// The same as metadata->columns but after call of Nested::collect().
+    ColumnsDescription columns_with_collected_nested;
+
     /// The Log engine uses the marks file, and the TinyLog engine doesn't.
     const bool use_marks_file;
 
@@ -141,6 +145,19 @@ private:
 
     std::atomic<UInt64> total_rows = 0;
     std::atomic<UInt64> total_bytes = 0;
+
+    struct DataValidationTasks : public IStorage::DataValidationTasksBase
+    {
+        DataValidationTasks(FileChecker::DataValidationTasksPtr file_checker_tasks_, ReadLock && lock_)
+            : file_checker_tasks(std::move(file_checker_tasks_)), lock(std::move(lock_))
+        {}
+
+        size_t size() const override { return file_checker_tasks->size(); }
+
+        FileChecker::DataValidationTasksPtr file_checker_tasks;
+        /// Lock to prevent table modification while checking
+        ReadLock lock;
+    };
 
     FileChecker file_checker;
 
